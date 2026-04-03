@@ -1,0 +1,30 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# SQLite databases (empirical + simulation output)
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# HDF5 source data
+*.h5
+*.hdf5
+
+# Extracted event files
+*_events.npz
+
+# WSE raw data and calibration artefacts
+data/WSELOB-2017/
+data/mo_depth_data/
+
+# Profiling artifacts
+*.prof
+profile_output.txt
+
+# Personal notes
+TODO.md
