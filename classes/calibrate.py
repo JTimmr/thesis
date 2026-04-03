@@ -35,9 +35,9 @@ import matplotlib.pyplot as plt
 from scipy import stats
 
 import optuna
+from tick.hawkes import HawkesExpKern, HawkesSumExpKern
 
-# Delay tick imports until first use so OMP_NUM_THREADS can be set by callers.
-# We import lazily inside methods that need them.
+from research_core.classes.parallelisation import run_parallel_optuna
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -134,8 +134,6 @@ class _SelfObjective:
         self.end_times = end_times
 
     def __call__(self, trial):
-        from tick.hawkes import HawkesExpKern
-
         beta = trial.suggest_float("beta", self.beta_min, self.beta_max, log=True)
         decays = np.array([[beta]])
 
@@ -181,8 +179,6 @@ class _MutualObjective:
     build_decay_matrix_from_trial = build_decay_matrix
 
     def __call__(self, trial):
-        from tick.hawkes import HawkesExpKern
-
         decays_matrix = self.build_decay_matrix(trial)
         model = HawkesExpKern(
             decays=decays_matrix, max_iter=self.MAX_ITER, tol=self.TOL,
@@ -220,8 +216,6 @@ class _SumExpSelfObjective:
         self.end_times = end_times
 
     def __call__(self, trial):
-        from tick.hawkes import HawkesSumExpKern
-
         betas = []
         for idx, (lo, hi) in enumerate(self.beta_ranges):
             betas.append(trial.suggest_float(
@@ -287,8 +281,6 @@ class _SumExpObjective:
         self.rho_target = rho_target
 
     def __call__(self, trial):
-        from tick.hawkes import HawkesSumExpKern
-
         betas = []
         for idx, (lo, hi) in enumerate(self.beta_ranges):
             betas.append(trial.suggest_float(
@@ -397,8 +389,6 @@ def plot_all_seasonality_patterns(
     -------
     fig, ax, stats_results
     """
-    from scipy import stats as sp_stats
-
     if marks_order is None:
         marks_order = list(seasonality_profiles.keys())
 
@@ -504,7 +494,7 @@ def plot_all_seasonality_patterns(
     }
 
     for i, name in enumerate(profile_names):
-        corr, p_value = sp_stats.pearsonr(profiles_matrix[i], avg_profile)
+        corr, p_value = stats.pearsonr(profiles_matrix[i], avg_profile)
         stats_results["correlations"][name] = {
             "correlation": corr, "p_value": p_value,
         }
@@ -514,7 +504,7 @@ def plot_all_seasonality_patterns(
     n_patterns = len(profile_names)
     for i in range(n_patterns):
         for j in range(i + 1, n_patterns):
-            corr, p_value = sp_stats.pearsonr(
+            corr, p_value = stats.pearsonr(
                 profiles_matrix[i], profiles_matrix[j],
             )
             pair_name = f"{profile_names[i]} vs {profile_names[j]}"
@@ -540,7 +530,7 @@ def plot_all_seasonality_patterns(
     }
 
     try:
-        friedman_stat, friedman_p = sp_stats.friedmanchisquare(
+        friedman_stat, friedman_p = stats.friedmanchisquare(
             *profiles_matrix
         )
         stats_results["friedman_test"] = {
@@ -1029,8 +1019,6 @@ class HawkesCalibration:
             models   — dict[dim_name → fitted HawkesExpKern]
             total_ll, per_event_ll — floats
         """
-        from tick.hawkes import HawkesExpKern
-
         events, end_times = self._resolve_events(use_tau)
         if gof_dims is None:
             gof_dims = []
@@ -1185,8 +1173,6 @@ class HawkesCalibration:
             score — float (per-event)
             model — fitted HawkesExpKern
         """
-        from tick.hawkes import HawkesExpKern
-
         os.environ["OMP_NUM_THREADS"] = "1"
 
         events, end_times = self._resolve_events(use_tau)
@@ -1339,8 +1325,6 @@ class HawkesCalibration:
             models   — dict[dim_name → fitted HawkesSumExpKern]
             total_ll, per_event_ll — floats
         """
-        from tick.hawkes import HawkesSumExpKern
-
         events, end_times = self._resolve_events(use_tau)
         label = "τ-time" if use_tau else "raw"
         if gof_dims is None:
@@ -1470,8 +1454,6 @@ class HawkesCalibration:
             score       — float
             model       — fitted HawkesSumExpKern
         """
-        from tick.hawkes import HawkesSumExpKern
-
         events, end_times = self._resolve_events(use_tau)
         label = "τ-time" if use_tau else "raw"
         if gof_dims is None:
@@ -1601,8 +1583,6 @@ class HawkesCalibration:
             models   -- dict[dim_name -> fitted HawkesSumExpKern]
             total_ll, per_event_ll -- floats
         """
-        from tick.hawkes import HawkesSumExpKern
-
         if beta_ranges is None:
             beta_ranges = [(10.0, 100.0), (1.0, 10.0), (0.005, 0.01)]
         n_components = len(beta_ranges)
@@ -1634,9 +1614,6 @@ class HawkesCalibration:
                   f"{n_workers} worker(s) ──")
 
             if n_workers > 1:
-                from research_core.classes.parallelisation import (
-                    run_parallel_optuna,
-                )
                 data_dict = {
                     "beta_ranges": beta_ranges,
                     "penalty": penalty,
@@ -1800,8 +1777,6 @@ class HawkesCalibration:
             model          -- fitted HawkesSumExpKern
             best_betas     -- 1-D array of optimized decay rates
         """
-        from tick.hawkes import HawkesSumExpKern
-
         if beta_ranges is None:
             beta_ranges = [(10.0, 100.0), (1.0, 10.0), (0.005, 0.01)]
         n_components = len(beta_ranges)
@@ -1817,9 +1792,6 @@ class HawkesCalibration:
         print(f"{'='*60}\n")
 
         if n_workers > 1:
-            from research_core.classes.parallelisation import (
-                run_parallel_optuna,
-            )
             data_dict = {
                 "beta_ranges": beta_ranges,
                 "penalty": penalty,
