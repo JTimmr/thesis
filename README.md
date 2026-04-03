@@ -4,7 +4,7 @@ This repository provides the simulation, calibration, and analysis toolkit for s
 
 ## Overview
 
-`research_core` provides a self-contained toolkit for studying order-driven market microstructure:
+This package provides a self-contained toolkit for studying order-driven market microstructure:
 
 - **Simulation** (`classes/simulate.py`) — Event-driven LOB simulator with Hawkes process arrivals (Poisson, univariate self-exciting, and multivariate mutually exciting models). Supports single and sum-of-exponentials kernels, empirical order placement and cancellation distributions, and full book state recording to SQLite.
 - **Calibration** (`classes/calibrate.py`) — Hawkes process parameter estimation via MLE with Optuna optimisation. Handles seasonality adjustment (raw time and tau-time), goodness-of-fit testing via the time-rescaling theorem, and parallel multi-worker calibration.
