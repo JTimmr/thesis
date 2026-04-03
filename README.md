@@ -1,6 +1,6 @@
-# research_core
+# Collusive Dynamics from Evolutionary Market-Making Strategies in a Calibrated Limit Order Book Simulation
 
-A Python package for limit order book (LOB) simulation, Hawkes process calibration, and market-maker backtesting. Built around empirical data from the Warsaw Stock Exchange (WSE) WSELOB-2017 dataset.
+This repository provides the simulation, calibration, and analysis toolkit for studying market microstructure and market-maker behaviour in a calibrated limit order book environment. Built around empirical data from the Warsaw Stock Exchange (WSE) WSELOB-2017 dataset.
 
 ## Overview
 
