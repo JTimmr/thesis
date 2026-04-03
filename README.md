@@ -4,15 +4,13 @@ This repository provides the simulation, calibration, and analysis toolkit for s
 
 ## Overview
 
-This package provides a self-contained toolkit for studying order-driven market microstructure:
-
-- **Simulation** (`classes/simulate.py`) — Event-driven LOB simulator with Hawkes process arrivals (Poisson, univariate self-exciting, and multivariate mutually exciting models). Supports single and sum-of-exponentials kernels, empirical order placement and cancellation distributions, and full book state recording to SQLite.
-- **Calibration** (`classes/calibrate.py`) — Hawkes process parameter estimation via MLE with Optuna optimisation. Handles seasonality adjustment (raw time and tau-time), goodness-of-fit testing via the time-rescaling theorem, and parallel multi-worker calibration.
-- **Order book** (`classes/orderbook.py`) — Heap-based order book implementation optimised for simulation throughput.
-- **Extraction** (`classes/extract.py`) — Transforms raw WSE HDF5 order and trade data into structured SQLite databases with full book state snapshots at each event.
-- **Analysis** (`classes/analyse.py`) — Statistical analysis of simulated and empirical order flow: stylised facts (fat tails, volatility clustering, aggregational Gaussianity, order sign autocorrelation, price impact) and comparative diagnostics.
-- **Market makers** (`classes/market_maker.py`) — Agent-based market-making strategies (simple symmetric, compact, Avellaneda-Stoikov) that plug into the simulator.
-- **Backtesting** (`classes/backtest.py`) — Multi-window market-maker backtesting with PnL, inventory, and fill statistics.
+- **Simulation** (`classes/simulate.py`) -- Event-driven LOB simulator with Hawkes process arrivals (Poisson, univariate self-exciting, and multivariate mutually exciting models). Supports single-exponential and triple-exponential (sum of three exponentials) kernels, empirical order placement and cancellation distributions, and full book state recording to SQLite.
+- **Calibration** (`classes/calibrate.py`) - Hawkes process parameter estimation via MLE with Optuna optimisation. Handles seasonality adjustment (raw time and tau-time), goodness-of-fit testing via the time-rescaling theorem, and parallel multi-worker calibration.
+- **Order book** (`classes/orderbook.py`) - Heap-based order book implementation optimised for efficient simulation.
+- **Extraction** (`classes/extract.py`) - Transforms raw WSE HDF5 order and trade data into structured SQLite databases with full book state snapshots at each event.
+- **Analysis** (`classes/analyse.py`) - Statistical analysis of simulated and empirical order flow: stylised facts (fat tails, volatility clustering, order sign autocorrelation, price impact) and comparative diagnostics.
+- **Market makers** (`classes/market_maker.py`) - Agent-based market-making strategies (simple symmetric, compact, Avellaneda-Stoikov) that plug into the simulator.
+- **Backtesting** (`classes/backtest.py`) - Multi-window market-maker backtesting with PnL, inventory, and fill statistics.
 
 ## Installation
 
@@ -26,9 +24,9 @@ Verify:
 python -c "from research_core.classes import Simulate; print('OK')"
 ```
 
-### Optional dependency
+### Dependencies
 
-Some calibration methods use the **tick** library (lazy-imported). Install it separately if needed; it is not a declared dependency.
+All dependencies, including **tick** (used for Hawkes process MLE fitting), are declared in `pyproject.toml` and installed automatically.
 
 ## Package layout
 

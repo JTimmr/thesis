@@ -28,6 +28,7 @@ import sys
 import tempfile
 import threading
 import time as _time
+import traceback
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -43,7 +44,12 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _create_objective(objective_type: str, data: dict):
-    """Instantiate the right Optuna objective from *data*."""
+    """Instantiate the right Optuna objective from *data*.
+
+    Imports from ``calibrate`` are deferred to avoid a circular dependency
+    (calibrate imports parallelisation at the top level).  These only execute
+    inside worker subprocesses, where no circular import can occur.
+    """
     if objective_type == "sumexp":
         from research_core.classes.calibrate import _SumExpObjective
         return _SumExpObjective(
@@ -267,7 +273,6 @@ def _main():
         print(f"Worker {args.worker_id} completed", flush=True)
     except Exception as exc:
         print(f"Worker {args.worker_id} error: {exc}", flush=True)
-        import traceback
         traceback.print_exc()
         raise
 
