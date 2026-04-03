@@ -2,8 +2,8 @@
 AnalyseMarket — unified analysis class for order-flow SQLite databases.
 
 Works with both:
-  • Real market data  (from extract_wse_events.py — has `day`, `cls_method`)
-  • Simulation output (from Simulate class  — has `bbo` table, no `day`)
+  - Empirical order-flow databases (partitioned by `day`, with `cls_method`)
+  - Simulation output databases (continuous `timestamp`, with `bbo` and `intensities` tables)
 """
 
 import sqlite3
@@ -1209,7 +1209,7 @@ class AnalyseMarket:
             for qi in range(n_q):
                 save_dict[f"r_q{qi}"] = r_quintiles[qi]
             np.savez_compressed(save_path, **save_dict)
-            print(f"\nSaved: {Path(save_path).resolve()}")
+            print(f"\nSaved: {Path(save_path).name}")
 
         return r_quintiles, depth_bounds
 
@@ -1326,7 +1326,7 @@ class AnalyseMarket:
         if save_path:
             Path(save_path).parent.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(save_path, **save_dict)
-            print(f"\nSaved: {Path(save_path).resolve()}")
+            print(f"\nSaved: {Path(save_path).name}")
 
     # ═══════════════════════════════════════════════════════════════════
     # Time-series overview plots
@@ -2335,7 +2335,7 @@ class AnalyseMarket:
                                              cap=800,
                                              n_log_bins=40):
         """ACF of MO signs with short-lag bar chart and long-lag
-        log-log power-law fit, matching the Hawkes calibration notebook.
+        log-log power-law fit.
 
         Parameters
         ----------

@@ -5,7 +5,7 @@ Empirical tables match ``research_core.classes.extract``.
 Simulation tables match ``research_core.classes.simulate`` (event DB written by ``Simulate.run``).
 """
 
-# ── Empirical order-flow DB (from extract_wse_events.py) ─────────────────
+# ── Empirical order-flow DB ───────────────────────────────────────────────
 
 CREATE_ORDERS_TABLE = """
 CREATE TABLE IF NOT EXISTS orders (

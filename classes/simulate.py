@@ -152,7 +152,7 @@ class Simulate:
             self._tw_cdfs = [_td[f"tw_cdf_q{i}"] for i in range(4)]
             self._tw_loaded = True
         else:
-            print(f"WARNING: {_tw_path} not found — falling back to static MO sizes")
+            print(f"WARNING: {_tw_path.name} not found — falling back to static MO sizes")
             self._tw_loaded = False
 
         self._tw_depth_history = []
@@ -404,9 +404,9 @@ class Simulate:
                 self._decays_list = [self.univariate_decays.copy()]
             else:  # triple
                 raise NotImplementedError(
-                    "Univariate triple-exp not yet calibrated. "
-                    "Run the calibration notebook first, then add the "
-                    "univariate_triple_* parameters here."
+                    "Univariate triple-exponential kernel is not yet calibrated. "
+                    "Calibrate the parameters and set univariate_triple_* attributes "
+                    "before using this mode."
                 )
 
         elif self.arrival_mode == "hawkes_multivariate":
@@ -545,7 +545,7 @@ class Simulate:
             )
         if os.path.exists(self.db_path) and overwrite:
             os.remove(self.db_path)
-            print(f"Overwriting existing database: {self.db_path}")
+            print(f"Overwriting existing database: {Path(self.db_path).name}")
         self._db_conn = sqlite3.connect(self.db_path)
         self._db_cursor = self._db_conn.cursor()
         self._db_cursor.execute("PRAGMA journal_mode=WAL")

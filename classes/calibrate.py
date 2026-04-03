@@ -14,8 +14,8 @@ Kernel modes
   "double"  — sum of two exponentials with FIXED decays [β_fast, β_slow],
               only α matrices and baselines are fitted (via tick.hawkes.HawkesSumExpKern)
 
-This module is self-contained: it does NOT import from objectives.py.
-All reusable logic from the calibration notebook is ported here.
+All calibration objectives, seasonality helpers, and goodness-of-fit utilities
+are contained within this module.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ import optuna
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Seasonality helpers  (ported from objectives.py — read-only copy)
+# Seasonality helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def get_average_seasonality_shape(
@@ -119,7 +119,7 @@ def create_average_time_transformer(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Optuna objectives  (ported from objectives.py — read-only copy)
+# Optuna objectives
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class _SelfObjective:
@@ -337,7 +337,7 @@ class _SumExpObjective:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GOF utilities  (ported + extended for double-exp)
+# Goodness-of-fit utilities
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def plot_time_rescaling_cdf(interarrival_times, title: str):
@@ -2044,7 +2044,7 @@ class HawkesCalibration:
         path = Path(path)
         with open(path, "wb") as f:
             pickle.dump(kwargs, f)
-        print(f"Saved: {path}")
+        print(f"Saved: {Path(path).name}")
 
     @staticmethod
     def load_params(path: Union[str, Path]) -> dict:

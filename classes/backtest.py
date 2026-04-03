@@ -634,8 +634,8 @@ class MMBacktester:
 
     @staticmethod
     def plot_summary(results_df: pd.DataFrame, title: Optional[str] = None):
-        """4-panel overview matching the screenshot style:
-        cumulative PnL, PnL distribution, trades/window, max inventory.
+        """4-panel overview: cumulative PnL, PnL distribution,
+        trades per window, and maximum inventory.
         """
         fig, axes = plt.subplots(2, 2, figsize=(14, 9))
 

@@ -1099,7 +1099,7 @@ def run_full_extraction(
     if day_keys is None:
         day_keys = list_day_keys_hdf(orders_h5)
 
-    print(f"Extracting {len(day_keys)} days for {asset} -> {db_path}")
+    print(f"Extracting {len(day_keys)} days for {asset} -> {Path(db_path).name}")
 
     conn = sqlite3.connect(str(db_path))
     cur = conn.cursor()
@@ -1170,4 +1170,4 @@ def run_full_extraction(
         print(f"  [{i+1}/{len(day_keys)}] {day_key}  LO/CXL={n_lo}  MOs={n_mo}")
 
     conn.close()
-    print(f"\nExtraction complete: {db_path}")
+    print(f"\nExtraction complete: {Path(db_path).name}")

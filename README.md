@@ -1,106 +1,104 @@
 # research_core
 
-Self-contained Python package for simulation, calibration, and analysis. Treat **this directory** as the **only** project root: it should contain `pyproject.toml`, `README.md`, `classes/`, `notebooks/`, etc. You can move it out of `Thesis/` and publish it as its own GitHub repository — nothing else from the old tree is required.
+A Python package for limit order book (LOB) simulation, Hawkes process calibration, and market-maker backtesting. Built around empirical data from the Warsaw Stock Exchange (WSE) WSELOB-2017 dataset.
 
-## GitHub
+## Overview
 
-1. Create an empty repository on GitHub.
-2. Copy or move this `research_core` folder to your machine (or keep it as-is if it is already the repo root).
-3. Inside that folder: `git init`, `git add .`, `git commit`, `git remote add origin …`, `git push`.
-4. Collaborators clone the repo, create a venv, and run `pip install -e .` as below.
+`research_core` provides a self-contained toolkit for studying order-driven market microstructure:
 
-## Install (editable)
+- **Simulation** (`classes/simulate.py`) — Event-driven LOB simulator with Hawkes process arrivals (Poisson, univariate self-exciting, and multivariate mutually exciting models). Supports single and sum-of-exponentials kernels, empirical order placement and cancellation distributions, and full book state recording to SQLite.
+- **Calibration** (`classes/calibrate.py`) — Hawkes process parameter estimation via MLE with Optuna optimisation. Handles seasonality adjustment (raw time and tau-time), goodness-of-fit testing via the time-rescaling theorem, and parallel multi-worker calibration.
+- **Order book** (`classes/orderbook.py`) — Heap-based order book implementation optimised for simulation throughput.
+- **Extraction** (`classes/extract.py`) — Transforms raw WSE HDF5 order and trade data into structured SQLite databases with full book state snapshots at each event.
+- **Analysis** (`classes/analyse.py`) — Statistical analysis of simulated and empirical order flow: stylised facts (fat tails, volatility clustering, aggregational Gaussianity, order sign autocorrelation, price impact) and comparative diagnostics.
+- **Market makers** (`classes/market_maker.py`) — Agent-based market-making strategies (simple symmetric, compact, Avellaneda-Stoikov) that plug into the simulator.
+- **Backtesting** (`classes/backtest.py`) — Multi-window market-maker backtesting with PnL, inventory, and fill statistics.
 
-From **this directory** (the repository root — the same folder that contains `pyproject.toml` and `classes/`):
+## Installation
 
 ```bash
-# Windows (PowerShell): optional but recommended
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-
-python -m pip install --upgrade pip
 pip install -e .
 ```
 
-Check:
+Verify:
 
 ```bash
-python -c "import research_core; from research_core.classes import Simulate; print('OK')"
+python -c "from research_core.classes import Simulate; print('OK')"
 ```
 
-Use the **same Python interpreter** where you ran `pip install` (including the Jupyter kernel).
+### Optional dependency
 
-Uninstall: `pip uninstall research-core`.
+Some calibration methods use the **tick** library (lazy-imported). Install it separately if needed; it is not a declared dependency.
 
-### Jupyter: terminal works, notebook does not
+## Package layout
 
-The integrated terminal and the notebook **do not share Python by default**. `pip install` applies only to the interpreter that ran `pip`. If the notebook kernel is another Python (Conda, another venv, or a different install), imports will fail until you align them.
+| Path | Description |
+|------|-------------|
+| `classes/` | Core domain logic: simulation engine, calibration, analysis, order book, market makers, backtesting |
+| `data/` | Database schema definitions (`schema.py`) and extraction helpers |
+| `validation/` | Smoke tests (`python -m research_core.validation.smoke_test`) |
+| `notebooks/` | Jupyter notebooks for calibration, simulation, analysis, and backtesting workflows |
 
-1. In a **terminal** (where `import research_core` works), print the interpreter:
+## Usage
 
-   ```bash
-   python -c "import sys; print(sys.executable)"
-   ```
+### Running a simulation
 
-2. In the **notebook**, run the same in the first cell:
+```python
+from research_core.classes import Simulate
 
-   ```python
-   import sys
-   print(sys.executable)
-   ```
-
-3. If the paths differ, fix one of these ways:
-   - **Cursor / VS Code:** Command Palette → **Notebook: Select Notebook Kernel** (or **Jupyter: Select Interpreter to start Jupyter server**) → choose the **same** environment as step 1 (often your `.venv` or the Store Python you used for `pip`).
-   - **Install into the notebook’s Python** (replace with the path from step 2):
-
-     ```powershell
-     & "C:\path\to\that\python.exe" -m pip install -e "c:\Users\jaspe\Documents\CLS\Thesis\research_core"
-     ```
-
-4. Imports must use the **installed package name**, not a bare `classes` module:
-
-   ```python
-   from research_core.classes import Simulate
-   ```
-
-   (`from classes import …` only works if you add extra path hacks; it is not what `pip install` registers.)
-
-## Layout
-
-| Path | Role |
-|------|------|
-| `classes/` | Domain logic (`Simulate`, order book, calibration, …) |
-| `data/` | Schema / extraction helpers |
-| `validation/` | Smoke tests |
-| `notebooks/` | Jupyter notebooks |
-
-Optional empirical tooling can live in `scripts/` (see `research_core.classes.helpers`).
-
-## Smoke test
-
-```bash
-python -m research_core.validation.smoke_test
+sim = Simulate(
+    arrival_mode="hawkes_multivariate",
+    T=184300,
+    kernel_mode="triple",
+    db_path="sim_events.sqlite",
+)
+sim.load_real_orderbook_snapshot(
+    asset="KGHM",
+    day_key="d20170110",
+    snapshot_time="10:00:00",
+)
+sim.run()
 ```
 
-## Optional: Hawkes / tick
+### Extracting empirical data
 
-Some calibration paths use **tick** (lazy-imported). Install tick separately if you need those features; it is not a declared dependency of `research-core`.
+```python
+from research_core.classes import run_full_extraction
+from pathlib import Path
+
+run_full_extraction(
+    asset="KGHM",
+    orders_h5=Path("data/WSELOB-2017/orders/KGHM_lob_2017_zlib.h5"),
+    trades_h5=Path("data/WSELOB-2017/trades/KGHM_lob_2017_zlib.h5"),
+    db_path=Path("data/KGHM_order_flow.sqlite"),
+)
+```
+
+### Querying a database
+
+```python
+from research_core.classes import list_day_keys_from_sqlite, load_day_events_from_sqlite
+import sqlite3
+
+days = list_day_keys_from_sqlite("data/KGHM_order_flow.sqlite")
+conn = sqlite3.connect("data/KGHM_order_flow.sqlite")
+events = load_day_events_from_sqlite(conn, days[0], "09:00:00", ["LO", "CXL", "MO"])
+conn.close()
+```
 
 ---
 
 ## SQLite database schema
 
-The project uses two families of SQLite databases with closely related but distinct schemas. Both are defined in `data/schema.py` and are **gitignored** (they are large, reproducible artefacts).
+The package uses two families of SQLite databases with closely related but distinct schemas. Both are defined in `data/schema.py`.
 
 ### 1. Empirical order-flow database
 
-Produced by `classes/extract.py` → `run_full_extraction()`. Each database covers a single asset (e.g. `KGHM_order_flow.sqlite`) and contains all trading days extracted from the raw WSE HDF5 files.
-
-Source data lives in `data/WSELOB-2017/orders/<ASSET>_lob_2017_zlib.h5` (also gitignored).
+Produced by `classes/extract.py` via `run_full_extraction()`. Each database covers a single asset (e.g. `KGHM_order_flow.sqlite`) and contains all trading days extracted from the raw WSE HDF5 files.
 
 #### Table: `orders`
 
-Every limit-order submission and cancellation observed in the LOB during continuous trading. Each row is one event with the book state captured **before** the event was applied.
+Every limit-order submission and cancellation observed in the LOB during continuous trading. Each row captures the book state **before** the event was applied.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -110,8 +108,8 @@ Every limit-order submission and cancellation observed in the LOB during continu
 | `order_id` | INTEGER | Exchange-assigned order identifier |
 | `side` | INTEGER | `1` = bid, `-1` = ask |
 | `order_price` | REAL | Price of this order (PLN) |
-| `best_bid` | REAL | Best bid **before** the event |
-| `best_ask` | REAL | Best ask **before** the event |
+| `best_bid` | REAL | Best bid before the event |
+| `best_ask` | REAL | Best ask before the event |
 | `best_same_side` | REAL | Best price on the same side as this order |
 | `best_bid_size` | REAL | Volume at the best bid |
 | `best_ask_size` | REAL | Volume at the best ask |
@@ -175,7 +173,7 @@ Aggregated market-order records. One row per market order (which may comprise mu
 | `best_bid` | REAL | Best bid before execution |
 | `best_ask` | REAL | Best ask before execution |
 | `ticks_walked` | INTEGER | Price levels consumed beyond BBO |
-| `ratio_L0` | REAL | `mo_volume / L0_depth` — how much of the top-of-book was consumed |
+| `ratio_L0` | REAL | `mo_volume / L0_depth` — fraction of top-of-book consumed |
 | `microprice` | REAL | Microprice before execution |
 | `opp_depth_L0..L9` | REAL | Opposite-side depth at 10 levels |
 | `bid_depth_L0..L4` | REAL | Bid depth at 5 levels |
@@ -185,11 +183,11 @@ Aggregated market-order records. One row per market order (which may comprise mu
 
 ### 2. Simulation database
 
-Produced by `Simulate.run()` when a `db_path` is supplied. Each run creates a fresh SQLite file (e.g. `sim_events_triple_full.sqlite`). The database uses WAL journaling and `PRAGMA synchronous=NORMAL` for write performance, and creates timestamp indices on close.
+Produced by `Simulate.run()` when a `db_path` is supplied. Each run creates a fresh SQLite file. The database uses WAL journaling and `PRAGMA synchronous=NORMAL` for write performance, and creates timestamp indices on close.
 
 #### Table: `orders`
 
-Mirrors the empirical `orders` table but with simulation-native types. The `day` column is dropped (a simulation has no day boundaries) and `timestamp` is `REAL` (Hawkes process time, not wall-clock).
+Mirrors the empirical `orders` table with simulation-native types. The `day` column is dropped (simulations have no day boundaries) and `timestamp` is `REAL` (Hawkes process time, not wall-clock).
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -222,7 +220,7 @@ Mirrors the empirical `orders` table but with simulation-native types. The `day`
 | `microprice` | REAL | Volume-weighted mid (PLN) |
 | `n_bid` | INTEGER | Distinct bid levels |
 | `n_ask` | INTEGER | Distinct ask levels |
-| `dp_mid` | REAL | Mid-price change since prev event (PLN) |
+| `dp_mid` | REAL | Mid-price change since previous event (PLN) |
 | `bid_depth_L0..L4` | REAL | Bid depth at 5 levels |
 | `ask_depth_L0..L4` | REAL | Ask depth at 5 levels |
 
@@ -250,7 +248,7 @@ One row per fill from a simulated market order.
 
 #### Table: `mo_orders`
 
-Aggregated market orders (simulation counterpart of the empirical `mo_orders`). Drops `day`, `first_time_ns`, and `cls_method`.
+Aggregated market orders. Drops `day`, `first_time_ns`, and `cls_method` relative to the empirical schema.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -273,7 +271,7 @@ Aggregated market orders (simulation counterpart of the empirical `mo_orders`). 
 
 #### Table: `bbo`
 
-Lightweight best-bid/offer snapshot recorded on **every** event (including events that don't produce an `orders` row).
+Lightweight best-bid/offer snapshot recorded on every event (including events that do not produce an `orders` row).
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -286,7 +284,7 @@ Lightweight best-bid/offer snapshot recorded on **every** event (including event
 
 #### Table: `intensities`
 
-Hawkes process intensity snapshot at each event time. Useful for verifying that the self-exciting dynamics behave as calibrated.
+Hawkes process intensity snapshot at each event time.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -311,63 +309,5 @@ Hawkes process intensity snapshot at each event time. Useful for verifying that 
 | MO timestamp | `first_time_ns INTEGER` (nanoseconds) | `timestamp REAL` |
 | Fill timestamp | `time_ns INTEGER` (nanoseconds) | `timestamp REAL` |
 | Classification | `cls_method TEXT` on fills/MO tables | Not applicable |
-| Extra tables | — | `bbo`, `intensities` |
+| Additional tables | -- | `bbo`, `intensities` |
 | Write strategy | Bulk insert per day, then commit | Buffered (flush every N events), WAL mode |
-
-### Reproducing the databases
-
-**Empirical database** (requires raw HDF5 data in `data/WSELOB-2017/orders/`):
-
-```python
-from research_core.classes import run_full_extraction
-from pathlib import Path
-
-run_full_extraction(
-    asset="KGHM",
-    orders_h5=Path("data/WSELOB-2017/orders/KGHM_lob_2017_zlib.h5"),
-    trades_h5=Path("data/WSELOB-2017/trades/KGHM_lob_2017_zlib.h5"),
-    db_path=Path("data/KGHM_order_flow.sqlite"),
-)
-```
-
-**Simulation database**:
-
-```python
-from research_core.classes import Simulate
-
-sim = Simulate(
-    arrival_mode="hawkes_multivariate",
-    T=184300,
-    kernel_mode="triple",
-    db_path="sim_events.sqlite",
-)
-sim.load_real_orderbook_snapshot(asset="KGHM", day_key="d20170110", snapshot_time="10:00:00")
-sim.run()
-```
-
-### Loading data from an existing database
-
-```python
-import sqlite3
-import pandas as pd
-
-conn = sqlite3.connect("data/KGHM_order_flow.sqlite")
-
-orders = pd.read_sql("SELECT * FROM orders WHERE day = 'd20170110'", conn)
-fills  = pd.read_sql("SELECT * FROM fills  WHERE day = 'd20170110'", conn)
-mo     = pd.read_sql("SELECT * FROM mo_orders WHERE day = 'd20170110'", conn)
-
-conn.close()
-```
-
-Or use the built-in helpers:
-
-```python
-from research_core.classes import list_day_keys_from_sqlite, load_day_events_from_sqlite
-import sqlite3
-
-days = list_day_keys_from_sqlite("data/KGHM_order_flow.sqlite")
-conn = sqlite3.connect("data/KGHM_order_flow.sqlite")
-events = load_day_events_from_sqlite(conn, days[0], "09:00:00", ["LO", "CXL", "MO"])
-conn.close()
-```
