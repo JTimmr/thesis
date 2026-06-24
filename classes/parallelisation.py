@@ -1,18 +1,19 @@
-"""
-Parallel Optuna optimisation for Hawkes process calibration.
+"""Parallel Optuna optimisation for Hawkes calibration.
 
-Designed for Windows where multiprocessing uses 'spawn'.  Each worker
-subprocess independently recreates its objective from a serialised data
-file, avoiding pickling issues with complex objects.
+The search runs across several worker subprocesses that share one
+SQLite-backed Optuna study. This is the practical way to parallelise on
+Windows, where multiprocessing uses spawn: each worker re-imports the package,
+rebuilds its objective from a pickled data file, and writes its trials back to
+the shared store. Pickling the objective directly would drag the whole event
+dataset across the process boundary, so the coordinator passes a data file.
 
-Coordinator API
----------------
-    run_parallel_optuna(data_dict, objective_type, n_workers, n_trials)
-
-Worker entry point (invoked by the coordinator via subprocess)::
+``run_parallel_optuna`` is the coordinator, called from ``HawkesCalibration``
+for the single-exponential (``"single"``) path and the sum-exp appendix
+(``"sumexp"`` / ``"sumexp_self"``). The module also serves as the worker entry
+point::
 
     python -m research_core.classes.parallelisation \
-        --mode worker --objective-type sumexp \
+        --mode worker --objective-type single \
         --data-file data.pkl --study-name my_study \
         --storage-url sqlite:///study.db --n-trials 50 --worker-id 0
 """
@@ -40,16 +41,32 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Worker functions — each runs inside a fresh subprocess
+# Worker functions: each runs inside a fresh subprocess
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _create_objective(objective_type: str, data: dict):
     """Instantiate the right Optuna objective from *data*.
 
-    Imports from ``calibrate`` are deferred to avoid a circular dependency
-    (calibrate imports parallelisation at the top level).  These only execute
-    inside worker subprocesses, where no circular import can occur.
+    Imports from ``calibrate`` are deferred to avoid a circular import
+    (``calibrate`` imports this module at the top level). They run only inside
+    worker subprocesses, where the circular import cannot occur.
     """
+    if objective_type == "single":
+        from research_core.classes.calibrate import _MutualObjective
+        return _MutualObjective(
+            beta_min=data["beta_min"],
+            beta_max=data["beta_max"],
+            n_nodes=data["n_nodes"],
+            marks_order=data["marks_order"],
+            max_iter=data["max_iter"],
+            tol=data["tol"],
+            events=data["events_dense"],
+            end_times=data["end_times_array"],
+        )
+
+    # Triple-kernel (sum-exp) objectives: experimental appendix.
+    # Used only by HawkesCalibration.fit_*_sumexp_optuna; remove together with
+    # the rest of the triple-kernel path.
     if objective_type == "sumexp":
         from research_core.classes.calibrate import _SumExpObjective
         return _SumExpObjective(
@@ -76,19 +93,6 @@ def _create_objective(objective_type: str, data: dict):
             end_times=data["end_times"],
         )
 
-    if objective_type == "single":
-        from research_core.classes.calibrate import _MutualObjective
-        return _MutualObjective(
-            beta_min=data["beta_min"],
-            beta_max=data["beta_max"],
-            n_nodes=data["n_nodes"],
-            marks_order=data["marks_order"],
-            MAX_ITER=data["MAX_ITER"],
-            TOL=data["TOL"],
-            events=data["events_dense"],
-            end_times=data["end_times_array"],
-        )
-
     raise ValueError(f"Unknown objective_type: {objective_type!r}")
 
 
@@ -109,8 +113,19 @@ def _run_worker(
     study.optimize(objective, n_trials=n_trials, n_jobs=1)
 
 
+def _read_worker_stdout(worker_id: int, process, out_q: queue.Queue) -> None:
+    """Copy one worker's stdout into the coordinator queue."""
+    try:
+        if process.stdout is None:
+            return
+        for line in process.stdout:
+            out_q.put((worker_id, line))
+    finally:
+        out_q.put((worker_id, None))
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# Coordinator — called from the main process (e.g. calibrate.py)
+# Coordinator: called from the main process (e.g. calibrate.py)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run_parallel_optuna(
@@ -127,7 +142,8 @@ def run_parallel_optuna(
     data_dict : dict
         Serialisable keyword arguments for the objective constructor.
     objective_type : str
-        ``"sumexp"``, ``"sumexp_self"``, or ``"single"``.
+        ``"single"`` (production single-exponential), or the sum-exp appendix
+        types ``"sumexp"`` / ``"sumexp_self"``.
     n_workers : int
         Number of parallel worker processes.
     n_trials : int
@@ -145,7 +161,6 @@ def run_parallel_optuna(
         study_name = f"hawkes_{objective_type}_{ts}"
 
     data_file = tmp / f"optuna_data_{ts}.pkl"
-    output_file = tmp / f"optuna_results_{ts}.pkl"
     db_path = tmp / f"{study_name}.db"
     storage_url = f"sqlite:///{db_path}"
 
@@ -167,7 +182,7 @@ def run_parallel_optuna(
 
     trials_per_worker = int(np.ceil(n_trials / n_workers))
 
-    # ── spawn workers ─────────────────────────────────────────────
+    # Spawn workers.
     processes = []
     for i in range(n_workers):
         cmd = [
@@ -189,18 +204,15 @@ def run_parallel_optuna(
     print(f"Launched {n_workers} workers "
           f"({trials_per_worker} trials each, {objective_type})")
 
-    # ── merge stdout via threads ──────────────────────────────────
+    # Merge worker stdout without blocking the coordinator loop.
     out_q: queue.Queue = queue.Queue()
 
-    def _reader(wid, p):
-        try:
-            for line in p.stdout:
-                out_q.put((wid, line))
-        finally:
-            out_q.put((wid, None))
-
     for wid, proc in processes:
-        t = threading.Thread(target=_reader, args=(wid, proc), daemon=True)
+        t = threading.Thread(
+            target=_read_worker_stdout,
+            args=(wid, proc, out_q),
+            daemon=True,
+        )
         t.start()
 
     done = 0
@@ -219,7 +231,7 @@ def run_parallel_optuna(
         if proc.returncode != 0:
             print(f"Worker {wid} exited with code {proc.returncode}")
 
-    # ── collect results ───────────────────────────────────────────
+    # Collect results.
     study = optuna.load_study(study_name=study_name, storage=storage_url)
     completed = [
         t for t in study.trials
@@ -238,7 +250,7 @@ def run_parallel_optuna(
         results = {"best_params": best.params, "best_value": best.value}
         print(f"Best score: {best.value:.6f}")
 
-    # ── cleanup ───────────────────────────────────────────────────
+    # Cleanup.
     for p in (data_file, db_path):
         try:
             p.unlink()

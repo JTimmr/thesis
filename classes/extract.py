@@ -24,11 +24,13 @@ from ..data.schema import (
     CREATE_ORDERS_TABLE,
     CREATE_FILLS_TABLE,
     CREATE_MO_ORDERS_TABLE,
+    ORDERS_DEPTH_LEVELS,
+    _ORDERS_N_BASE_COLS,
 )
 
 TZ = "Europe/Warsaw"
 
-_N_ORDER_COLS = 41
+_N_ORDER_COLS = _ORDERS_N_BASE_COLS + 2 * ORDERS_DEPTH_LEVELS
 _INSERT_ORDERS_SQL = (
     "INSERT INTO orders VALUES (" + ",".join(["?"] * _N_ORDER_COLS) + ")"
 )
@@ -251,6 +253,34 @@ def infer_trade_side(
     return None
 
 
+def summarize_side_stats(side_stats: dict) -> pd.DataFrame:
+    """Turn raw Lee-Ready counters into a per-rule breakdown.
+
+    ``infer_trade_side`` accumulates one counter per terminal outcome
+    (``quote_buy``, ``mid_sell``, ``tick_used``, ...).  ``extract_events_for_day``
+    returns that dict under ``_side_stats``.  This collapses the counters to the
+    underlying rule (quote / midpoint / tick / last_side / unclassified) and adds
+    the share of all trades, which is the number to quote for data quality.
+
+    Returns a DataFrame with columns ``rule``, ``count`` and ``share``.
+    """
+    n_trades = side_stats.get("n_trades", 0)
+    by_rule: dict = {}
+    for key in _CLS_KEYS:
+        rule = _CLS_MAP[key]
+        by_rule[rule] = by_rule.get(rule, 0) + side_stats.get(key, 0)
+
+    rows = [
+        {
+            "rule": rule,
+            "count": count,
+            "share": (count / n_trades) if n_trades else float("nan"),
+        }
+        for rule, count in by_rule.items()
+    ]
+    return pd.DataFrame(rows)
+
+
 # ─────────────────────────────────────────────────────────────
 # Order book helpers
 # ─────────────────────────────────────────────────────────────
@@ -471,7 +501,7 @@ def extract_events_for_day(
     return_diagnostics: bool = False,
     full_extraction: bool = False,
     day_key: str = None,
-    depth_levels: int = 5,
+    depth_levels: int = ORDERS_DEPTH_LEVELS,
     mo_depth_levels: int = 10,
     group_gap_us: int = 100,
 ):
@@ -496,11 +526,12 @@ def extract_events_for_day(
     day_key : str
         Trading day key (e.g. '20170102').
     depth_levels : int
-        Number of price levels to snapshot on each side of the book
-        for LO/CXL events (default 5).
+        Same-side book levels snapshotted per LO/CXL event into the ``orders``
+        table. Must equal ``data.schema.ORDERS_DEPTH_LEVELS`` so the row width
+        matches ``CREATE_ORDERS_TABLE`` (this is the default).
     mo_depth_levels : int
-        Number of opposite-side depth levels to snapshot for each
-        MO fill (default 10).
+        Opposite-side levels snapshotted per MO fill. The ``fills`` and
+        ``mo_orders`` tables hold 10 ``opp_depth`` columns, so this stays 10.
     group_gap_us : int
         Maximum gap in microseconds between fills in the same
         aggressive MO (default 100).
@@ -1077,6 +1108,7 @@ def run_full_extraction(
     time_field: str = "time",
     force: bool = False,
     day_keys: Optional[List[str]] = None,
+    depth_levels: int = ORDERS_DEPTH_LEVELS,
 ):
     """Run the full extraction pipeline from raw HDF5 to SQLite.
 
@@ -1095,6 +1127,10 @@ def run_full_extraction(
     day_keys : list or None
         Specific day keys to extract.  If ``None``, all days in the HDF5
         file are used.
+    depth_levels : int
+        Same-side depth levels per LO/CXL row in ``orders``
+        (default matches ``data.schema.ORDERS_DEPTH_LEVELS``).
+        Must match ``data/schema.py`` ``CREATE_ORDERS_TABLE``.
     """
     if day_keys is None:
         day_keys = list_day_keys_hdf(orders_h5)
@@ -1122,6 +1158,7 @@ def run_full_extraction(
             tick_size=tick_size,
             full_extraction=True,
             day_key=day_key,
+            depth_levels=depth_levels,
         )
 
         lo_cxl_rows = events.pop("_lo_cxl_rows", [])

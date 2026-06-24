@@ -6,9 +6,20 @@ Simulation tables match ``research_core.classes.simulate`` (event DB written by 
 """
 
 # ── Empirical order-flow DB ───────────────────────────────────────────────
+#
+# Side conventions (written by research_core.classes.extract, read by
+# research_core.classes.helpers):
+#   * orders.side                 INTEGER: 1 = bid side, 2 = ask side
+#                                           (LO/CXL events).
+#   * fills.side, mo_orders.side  TEXT: 'buy' / 'sell', the Lee-Ready
+#                                           trade direction.
+# Calibration marks map onto these as: MO_bid is a buy market order ('buy'),
+# MO_ask is a sell market order ('sell'); LO_bid / CXL_bid use side = 1, and
+# LO_ask / CXL_ask use side = 2.
 
-CREATE_ORDERS_TABLE = """
-CREATE TABLE IF NOT EXISTS orders (
+ORDERS_DEPTH_LEVELS = 40
+
+_ORDERS_BASE_COLS = """\
     day              TEXT,
     timestamp        TEXT,
     event_type       TEXT,
@@ -51,21 +62,23 @@ CREATE TABLE IF NOT EXISTS orders (
     microprice       REAL,
     n_bid            INTEGER,
     n_ask            INTEGER,
-    dp_mid           REAL,
+    dp_mid           REAL"""
 
-    bid_depth_L0     REAL,
-    bid_depth_L1     REAL,
-    bid_depth_L2     REAL,
-    bid_depth_L3     REAL,
-    bid_depth_L4     REAL,
+_ORDERS_N_BASE_COLS = 31
 
-    ask_depth_L0     REAL,
-    ask_depth_L1     REAL,
-    ask_depth_L2     REAL,
-    ask_depth_L3     REAL,
-    ask_depth_L4     REAL
-)
-"""
+
+def _build_create_orders_ddl(n_levels: int) -> str:
+    bid_cols = ",\n".join(f"    bid_depth_L{i:<3d}  REAL" for i in range(n_levels))
+    ask_cols = ",\n".join(f"    ask_depth_L{i:<3d}  REAL" for i in range(n_levels))
+    return (
+        "CREATE TABLE IF NOT EXISTS orders (\n"
+        + _ORDERS_BASE_COLS + ",\n\n"
+        + bid_cols + ",\n\n"
+        + ask_cols + "\n)"
+    )
+
+
+CREATE_ORDERS_TABLE = _build_create_orders_ddl(ORDERS_DEPTH_LEVELS)
 
 CREATE_FILLS_TABLE = """
 CREATE TABLE IF NOT EXISTS fills (
@@ -148,9 +161,13 @@ CREATE TABLE IF NOT EXISTS mo_orders (
 
 # ── Simulation DB (from Simulate) ───────────────────────────────────────
 
-SIM_CREATE_ORDERS = """
-CREATE TABLE IF NOT EXISTS orders (
-    timestamp        REAL,
+# Same-side book depth levels recorded per event in the orders table.  This
+# sets the deepest phantom that can be labelled: max_delta = N * tick.  The
+# empirical extraction uses 40 levels (=> 2.0 PLN at tick 0.05); match it so
+# the simulation labels cover the same delta grid.
+SIM_ORDER_DEPTH_LEVELS = 40
+
+_SIM_ORDERS_SCALAR_DDL = """    timestamp        REAL,
     event_type       TEXT,
     order_id         INTEGER,
     side             INTEGER,
@@ -179,18 +196,23 @@ CREATE TABLE IF NOT EXISTS orders (
     microprice       REAL,
     n_bid            INTEGER,
     n_ask            INTEGER,
-    dp_mid           REAL,
-    bid_depth_L0     REAL,
-    bid_depth_L1     REAL,
-    bid_depth_L2     REAL,
-    bid_depth_L3     REAL,
-    bid_depth_L4     REAL,
-    ask_depth_L0     REAL,
-    ask_depth_L1     REAL,
-    ask_depth_L2     REAL,
-    ask_depth_L3     REAL,
-    ask_depth_L4     REAL
-)"""
+    dp_mid           REAL"""
+
+_SIM_ORDERS_N_SCALAR_COLS = 30  # number of columns in _SIM_ORDERS_SCALAR_DDL
+
+
+def _sim_create_orders_ddl(n_levels: int) -> str:
+    bid = ",\n".join(f"    bid_depth_L{i:<3d}  REAL" for i in range(n_levels))
+    ask = ",\n".join(f"    ask_depth_L{i:<3d}  REAL" for i in range(n_levels))
+    return (
+        "\nCREATE TABLE IF NOT EXISTS orders (\n"
+        + _SIM_ORDERS_SCALAR_DDL + ",\n"
+        + bid + ",\n"
+        + ask + "\n)"
+    )
+
+
+SIM_CREATE_ORDERS = _sim_create_orders_ddl(SIM_ORDER_DEPTH_LEVELS)
 
 SIM_CREATE_FILLS = """
 CREATE TABLE IF NOT EXISTS fills (
@@ -280,7 +302,7 @@ CREATE TABLE IF NOT EXISTS intensities (
 
 # ── Prepared-statement helpers (simulation) ──────────────────────────────
 
-SIM_N_ORDER_COLS = 40
+SIM_N_ORDER_COLS = _SIM_ORDERS_N_SCALAR_COLS + 2 * SIM_ORDER_DEPTH_LEVELS
 SIM_INSERT_ORDER = (
     "INSERT INTO orders VALUES (" + ",".join(["?"] * SIM_N_ORDER_COLS) + ")"
 )
