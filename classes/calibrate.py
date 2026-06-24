@@ -1,31 +1,34 @@
-"""
-HawkesCalibration — unified calibration class for Hawkes processes.
+"""Hawkes process calibration for WSE order flow.
 
-Supports:
-  - Poisson baseline calibration
-  - Univariate (self-exciting) Hawkes with single or double exponential kernels
-  - Multivariate (mutually exciting) Hawkes with single or double exponential kernels
-  - Raw time and seasonality-adjusted τ-time
-  - Goodness-of-fit via time-rescaling theorem (compensator interarrivals)
+The production model is the single-exponential multivariate Hawkes process.
+Each kernel is ``φ_ij(t) = α_ij β_ij exp(−β_ij t)``, fitted by maximum
+likelihood: Optuna searches the decay rates ``β_ij`` and the ``tick`` learner
+returns the baseline ``μ`` and adjacency ``α``. The same code path fits the
+Poisson baseline and the per-dimension univariate Hawkes used as sanity checks.
 
-Kernel modes
-------------
-  "single"  — one exponential per kernel, β searched via Optuna
-  "double"  — sum of two exponentials with FIXED decays [β_fast, β_slow],
-              only α matrices and baselines are fitted (via tick.hawkes.HawkesSumExpKern)
+Calibration runs in two time domains. Raw clock time is the default. The other
+is seasonality-adjusted ``τ``-time, where a shared intraday profile is
+integrated to ``τ(t) = ∫₀ᵗ s̄(u) du`` so deterministic time-of-day variation is
+removed before fitting.
 
-All calibration objectives, seasonality helpers, and goodness-of-fit utilities
-are contained within this module.
+Goodness of fit uses the time-rescaling theorem. The fitted compensator turns
+each dimension's events into interarrivals that should look Exponential(1) when
+the model is right.
+
+A sum-of-exponentials ("triple kernel") path lives in the appendix at the
+bottom of this module. It is kept separate on purpose so it can be deleted in
+one block if the thesis stays with single-exponential kernels.
+
+``tick`` is a hard dependency (see ``pyproject.toml``). It pins to older Python
+on Windows, so calibration usually runs in its own environment.
 """
 
 from __future__ import annotations
 
 import os
-import sys
 import pickle
-import subprocess
-import tempfile
 import time as _time
+from functools import partial
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -107,15 +110,40 @@ def create_average_time_transformer(
     avg_data = get_average_seasonality_shape(
         seasonality_profiles, marks_order, normalize
     )
-    grid = avg_data["grid"]
-    cum_int = avg_data["cumulative_integral"]
-
-    def transform_time(t):
-        t = np.atleast_1d(t)
-        t = np.clip(t, 0.0, grid[-1])
-        return np.interp(t, grid, cum_int)
+    transform_time = partial(
+        _transform_time_from_average_profile,
+        grid=avg_data["grid"],
+        cumulative_integral=avg_data["cumulative_integral"],
+    )
 
     return transform_time, avg_data
+
+
+def _transform_time_from_average_profile(
+    t,
+    *,
+    grid: np.ndarray,
+    cumulative_integral: np.ndarray,
+) -> np.ndarray:
+    """Map clock time to tau-time using the average seasonality integral."""
+    t = np.atleast_1d(t)
+    t = np.clip(t, 0.0, grid[-1])
+    return np.interp(t, grid, cumulative_integral)
+
+
+def _format_mean_ci(vals, fmt: str = ".6f") -> str:
+    """Format the sample mean and a 95% t confidence interval."""
+    vals = np.asarray(vals, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    n = len(vals)
+    mean_value = vals.mean() if n > 0 else np.nan
+    if n < 2:
+        return f"{mean_value:{fmt}}"
+    sem = vals.std(ddof=1) / np.sqrt(n)
+    t_critical = stats.t.ppf(0.975, df=n - 1)
+    lower, upper = mean_value - t_critical * sem, mean_value + t_critical * sem
+    pct = (t_critical * sem / abs(mean_value) * 100) if mean_value != 0 else float("inf")
+    return f"{mean_value:{fmt}}  95% CI [{lower:{fmt}}, {upper:{fmt}}] (+/-{pct:.1f}%)"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -125,11 +153,11 @@ def create_average_time_transformer(
 class _SelfObjective:
     """Optuna objective for univariate (self-exciting) Hawkes calibration."""
 
-    def __init__(self, beta_min, beta_max, MAX_ITER, TOL, events, end_times):
+    def __init__(self, beta_min, beta_max, max_iter, tol, events, end_times):
         self.beta_min = beta_min
         self.beta_max = beta_max
-        self.MAX_ITER = MAX_ITER
-        self.TOL = TOL
+        self.max_iter = max_iter
+        self.tol = tol
         self.events = events
         self.end_times = end_times
 
@@ -137,7 +165,7 @@ class _SelfObjective:
         beta = trial.suggest_float("beta", self.beta_min, self.beta_max, log=True)
         decays = np.array([[beta]])
 
-        model = HawkesExpKern(decays=decays, max_iter=self.MAX_ITER, tol=self.TOL)
+        model = HawkesExpKern(decays=decays, max_iter=self.max_iter, tol=self.tol)
         try:
             model.fit(self.events)
             alpha = float(model.adjacency[0, 0])
@@ -154,15 +182,15 @@ class _MutualObjective:
     """Optuna objective for multivariate Hawkes calibration (single-exp)."""
 
     def __init__(
-        self, beta_min, beta_max, n_nodes, marks_order, MAX_ITER, TOL,
+        self, beta_min, beta_max, n_nodes, marks_order, max_iter, tol,
         events, end_times,
     ):
         self.beta_min = beta_min
         self.beta_max = beta_max
         self.n_nodes = n_nodes
         self.marks_order = marks_order
-        self.MAX_ITER = MAX_ITER
-        self.TOL = TOL
+        self.max_iter = max_iter
+        self.tol = tol
         self.events = events
         self.end_times = end_times
 
@@ -175,13 +203,10 @@ class _MutualObjective:
                 )
         return decays
 
-    # Alias kept for compatibility with run_optuna_parallel.py
-    build_decay_matrix_from_trial = build_decay_matrix
-
     def __call__(self, trial):
         decays_matrix = self.build_decay_matrix(trial)
         model = HawkesExpKern(
-            decays=decays_matrix, max_iter=self.MAX_ITER, tol=self.TOL,
+            decays=decays_matrix, max_iter=self.max_iter, tol=self.tol,
         )
         try:
             model.fit(self.events)
@@ -194,138 +219,8 @@ class _MutualObjective:
         br = max(np.linalg.eigvals(A).real)
         if br >= 1.0:
             return -np.inf
-        print(f"Trial {trial.number} → {score:.6f}")
+        print(f"Trial {trial.number} -> {score:.6f}")
         return float(score)
-
-
-class _SumExpSelfObjective:
-    """Optuna objective for univariate sum-of-exponentials Hawkes.
-
-    Searches over N shared decay rates (one per component), ordered
-    fastest-to-slowest.  Each beta_i is drawn from its own range.
-    """
-
-    def __init__(self, beta_ranges, penalty, C,
-                 max_iter, tol, events, end_times):
-        self.beta_ranges = beta_ranges
-        self.penalty = penalty
-        self.C = C
-        self.max_iter = max_iter
-        self.tol = tol
-        self.events = events
-        self.end_times = end_times
-
-    def __call__(self, trial):
-        betas = []
-        for idx, (lo, hi) in enumerate(self.beta_ranges):
-            betas.append(trial.suggest_float(
-                f"beta_{idx}", lo, hi, log=True,
-            ))
-        if sorted(betas, reverse=True) != betas:
-            return -np.inf
-
-        decays = np.array(betas)
-        learner = HawkesSumExpKern(
-            decays=decays, penalty=self.penalty, C=self.C,
-            max_iter=self.max_iter, tol=self.tol, verbose=False,
-        )
-        try:
-            learner.fit(self.events)
-            kernel_norm = float(learner.adjacency.sum())
-            if kernel_norm >= 1.0:
-                return -np.inf
-            score = float(learner.score(
-                events=self.events, end_times=self.end_times,
-            ))
-        except Exception as e:
-            print("CRASH:", e, flush=True)
-            raise
-        return score
-
-
-class _SumExpObjective:
-    """Optuna objective for multivariate sum-of-exponentials Hawkes.
-
-    Searches over N shared decay rates (one per component), ordered
-    fastest-to-slowest.  Each beta_i is drawn from its own range.
-
-    Supercritical kernels (spectral radius > ``rho_target``) are scaled
-    down to exactly ``rho_target`` before scoring, so the log-likelihood
-    reflects the fit quality of the model that will actually be used in
-    simulation.
-
-    Parameters
-    ----------
-    slow_self_floor : dict or None
-        Soft penalty ensuring the slowest kernel carries a minimum fraction
-        of each specified dimension's self-excitation.
-        Keys: ``"dims"`` (list of int) and ``"r_target"`` (float, e.g. 0.20).
-        Penalty per dimension: ``max(0, r_target / r - 1)`` where
-        ``r = α_slow[dim,dim] / Σ_k α_k[dim,dim]``.
-    rho_target : float
-        Target spectral radius.  Kernels with ρ > rho_target are scaled
-        to this value before the score is computed.
-    """
-
-    def __init__(self, beta_ranges, penalty, C,
-                 max_iter, tol, events, end_times,
-                 slow_self_floor=None, rho_target=0.95):
-        self.beta_ranges = beta_ranges
-        self.penalty = penalty
-        self.C = C
-        self.max_iter = max_iter
-        self.tol = tol
-        self.events = events
-        self.end_times = end_times
-        self.slow_self_floor = slow_self_floor
-        self.rho_target = rho_target
-
-    def __call__(self, trial):
-        betas = []
-        for idx, (lo, hi) in enumerate(self.beta_ranges):
-            betas.append(trial.suggest_float(
-                f"beta_{idx}", lo, hi, log=True,
-            ))
-        if sorted(betas, reverse=True) != betas:
-            return -np.inf
-
-        decays = np.array(betas)
-        learner = HawkesSumExpKern(
-            decays=decays, penalty=self.penalty, C=self.C,
-            max_iter=self.max_iter, tol=self.tol, verbose=False,
-        )
-        try:
-            learner.fit(self.events)
-            adj = learner.adjacency
-            kernel_norms = adj.sum(axis=2)
-            rho = float(max(np.linalg.eigvals(kernel_norms).real))
-
-            if rho > self.rho_target:
-                scaled_adj = adj * (self.rho_target / rho)
-            else:
-                scaled_adj = adj
-
-            score = float(learner.score(
-                events=self.events, end_times=self.end_times,
-                adjacency=scaled_adj,
-            ))
-        except Exception as e:
-            print("CRASH:", e, flush=True)
-            raise
-
-        if self.slow_self_floor is not None:
-            r_target = self.slow_self_floor["r_target"]
-            for dim in self.slow_self_floor["dims"]:
-                total = adj[dim, dim, :].sum()
-                if total > 0:
-                    r = adj[dim, dim, -1] / total
-                    if r > 0:
-                        score -= max(0.0, (r_target / r) - 1.0)
-                    else:
-                        score -= 100.0
-        beta_str = ", ".join(f"β_{i}={b:.4f}" for i, b in enumerate(betas))
-        print(f"Trial {trial.number} → {score:.6f}  (ρ={rho:.4f}, {beta_str})")
-        return score
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -653,88 +548,6 @@ def compensator_interarrivals_single(
     return [np.array(inc) for inc in increments]
 
 
-def compensator_interarrivals_double(
-    day_sequences: list,
-    decays: np.ndarray,
-    adjacency: np.ndarray,
-    baseline: np.ndarray,
-) -> list:
-    """Compensator interarrivals for **double-exponential** (sum-exp) kernels.
-
-    Parameters
-    ----------
-    day_sequences : list of arrays, one per dimension (single day)
-    decays        : 1-D array of length U (e.g. [15, 2])
-    adjacency     : (n_nodes, n_nodes, U)  — α^u_{ij}
-    baseline      : (n_nodes,)
-
-    Kernel for (i,j):
-        φ_{ij}(t) = Σ_u  α^u_{ij} · β^u · exp(−β^u · t)
-
-    Returns
-    -------
-    list of arrays, one per dimension, with compensator increments.
-    """
-    n_nodes = len(day_sequences)
-    U = len(decays)
-
-    all_times = np.concatenate(day_sequences) if day_sequences else np.array([])
-    if len(all_times) == 0:
-        return [np.array([]) for _ in range(n_nodes)]
-
-    marks = np.concatenate([
-        np.full(len(seq), idx, dtype=np.int64)
-        for idx, seq in enumerate(day_sequences)
-    ])
-
-    order = np.argsort(all_times)
-    sorted_t = all_times[order]
-    sorted_m = marks[order]
-
-    # kernel_state[u, i, j] — auxiliary state for decay u, target i, source j
-    kernel_state = np.zeros((U, n_nodes, n_nodes), dtype=np.float64)
-    comp = np.zeros(n_nodes, dtype=np.float64)
-    last_comp = np.zeros(n_nodes, dtype=np.float64)
-    increments: List[list] = [[] for _ in range(n_nodes)]
-
-    prev_t = 0.0
-    idx = 0
-    while idx < len(sorted_t):
-        cur_t = sorted_t[idx]
-        dt = cur_t - prev_t
-        if dt > 0:
-            # baseline contribution
-            comp += baseline * dt
-            # kernel contribution per decay
-            for u in range(U):
-                beta_u = decays[u]
-                decay_f = np.exp(-beta_u * dt)
-                # integrated kernel contribution:
-                # ∫ kernel_state * exp(-β dt') dt' from 0 to dt
-                # = kernel_state * (1 - exp(-β dt)) / β
-                comp += (kernel_state[u] * (1.0 - decay_f) / beta_u).sum(axis=1)
-                kernel_state[u] *= decay_f
-
-        # record increments
-        start = idx
-        while start < len(sorted_t) and sorted_t[start] == cur_t:
-            d = sorted_m[start]
-            increments[d].append(comp[d] - last_comp[d])
-            last_comp[d] = comp[d]
-            start += 1
-
-        # apply jumps — kernel_state jump = α^u_{ij} · β^u
-        while idx < start:
-            src = sorted_m[idx]
-            for u in range(U):
-                kernel_state[u, :, src] += adjacency[:, src, u] * decays[u]
-            idx += 1
-
-        prev_t = cur_t
-
-    return [np.array(inc) for inc in increments]
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # Main class
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -758,10 +571,6 @@ class HawkesCalibration:
         Maximum EM iterations for tick learners (default 1_000_000).
     tol : float
         Convergence tolerance for tick learners (default 1e-9).
-    beta_fast : float
-        Fast decay rate for double-exponential kernels (default 15.0).
-    beta_slow : float
-        Slow decay rate for double-exponential kernels (default 2.0).
     """
 
     def __init__(
@@ -772,16 +581,12 @@ class HawkesCalibration:
         seasonality_profiles: Optional[dict] = None,
         max_iter: int = 1_000_000,
         tol: float = 1e-9,
-        beta_fast: float = 15.0,
-        beta_slow: float = 0.3,
     ):
         # ── validate & store ──────────────────────────────────────
         self.marks_order = list(marks_order)
         self.n_nodes = len(self.marks_order)
         self.max_iter = max_iter
         self.tol = tol
-        self.BETA_FAST = beta_fast
-        self.BETA_SLOW = beta_slow
 
         # Ensure contiguous float64 arrays everywhere
         self.timestamps_by_day = [
@@ -888,10 +693,10 @@ class HawkesCalibration:
         Returns
         -------
         dict with keys:
-            pooled_df    — pd.DataFrame with pooled MLE results
-            daily_df     — pd.DataFrame with per-day MLE results
-            total_ll     — float, total log-likelihood
-            per_event_ll — float, per-event log-likelihood
+            pooled_df    : pd.DataFrame with pooled MLE results
+            daily_df     : pd.DataFrame with per-day MLE results
+            total_ll     : float, total log-likelihood
+            per_event_ll : float, per-event log-likelihood
         """
         events, end_times = self._resolve_events(use_tau)
         if gof_dims is None:
@@ -968,30 +773,20 @@ class HawkesCalibration:
                 })
         daily_df = pd.DataFrame(daily_rows)
 
-        def _ci_str(vals, fmt=".6f"):
-            vals = np.asarray(vals, dtype=float)
-            vals = vals[np.isfinite(vals)]
-            n = len(vals)
-            m = vals.mean() if n > 0 else np.nan
-            if n < 2:
-                return f"{m:{fmt}}"
-            sem = vals.std(ddof=1) / np.sqrt(n)
-            tc = stats.t.ppf(0.975, df=n - 1)
-            lo, hi = m - tc * sem, m + tc * sem
-            pct = (tc * sem / abs(m) * 100) if m != 0 else float("inf")
-            return f"{m:{fmt}}  95% CI [{lo:{fmt}}, {hi:{fmt}}] (±{pct:.1f}%)"
-
         _pday = daily_df.groupby("day").agg(
             total_ll=("log_likelihood", "sum"),
             total_n=("n_events", "sum"),
         ).reset_index()
         _pday["per_event"] = _pday["total_ll"] / _pday["total_n"]
 
-        print(f"\n── Poisson per-day calibration ({label}, mean ± 95% CI) ──")
+        print(f"\n-- Poisson per-day calibration ({label}, mean +/- 95% CI) --")
         for dim_name in self.marks_order:
             vals = daily_df[daily_df["dim"] == dim_name]["mu"].values
-            print(f"  {dim_name:8s}  μ = {_ci_str(vals)}")
-        print(f"\n  Per-event (per-day MLE): {_ci_str(_pday['per_event'].values)}")
+            print(f"  {dim_name:8s}  mu = {_format_mean_ci(vals)}")
+        print(
+            "\n  Per-event (per-day MLE): "
+            f"{_format_mean_ci(_pday['per_event'].values)}"
+        )
 
         return {
             "pooled_df": pooled_df,
@@ -1001,7 +796,7 @@ class HawkesCalibration:
         }
 
     # ══════════════════════════════════════════════════════════════
-    # 2.  Univariate Hawkes — single exponential
+    # 2.  Univariate Hawkes: single exponential
     # ══════════════════════════════════════════════════════════════
 
     def fit_univariate_hawkes(
@@ -1015,9 +810,9 @@ class HawkesCalibration:
         """Fit independent univariate Hawkes per dimension (single-exp kernel).
 
         Returns dict with keys:
-            df       — pd.DataFrame with per-dimension results
-            models   — dict[dim_name → fitted HawkesExpKern]
-            total_ll, per_event_ll — floats
+            df       : pd.DataFrame with per-dimension results
+            models   : dict[dim_name -> fitted HawkesExpKern]
+            total_ll, per_event_ll : floats
         """
         events, end_times = self._resolve_events(use_tau)
         if gof_dims is None:
@@ -1133,7 +928,7 @@ class HawkesCalibration:
         }
 
     # ══════════════════════════════════════════════════════════════
-    # 3.  Multivariate Hawkes — single exponential
+    # 3.  Multivariate Hawkes: single exponential
     # ══════════════════════════════════════════════════════════════
 
     def fit_multivariate_hawkes(
@@ -1144,34 +939,36 @@ class HawkesCalibration:
         beta_min: float = 0.1,
         beta_max: float = 20.0,
         gof_dims: Optional[List[str]] = None,
-        parallel_script: Optional[Path] = None,
     ) -> dict:
-        """Fit multivariate Hawkes with single-exponential kernels.
+        """Fit the multivariate single-exponential Hawkes process.
 
-        Uses parallel Optuna (subprocess-based) to search over per-kernel
-        decay rates β_{ij}, then refits at the best β matrix.
+        This is the production calibration behind every figure. Optuna searches
+        the per-kernel decay rates ``β_{ij}``; the model is then refit at the
+        best matrix to read off the baseline ``μ`` and adjacency ``α``.
+
+        With ``n_workers > 1`` the search is spread across subprocess workers
+        (:func:`parallelisation.run_parallel_optuna`), which is the fast path on
+        Windows where multiprocessing uses spawn. ``n_workers == 1`` runs the
+        study in-process. This is slower, but useful for smoke tests.
 
         Parameters
         ----------
         use_tau : bool
-            Whether to use τ-time.
-        n_trials, n_workers : int
-            Optuna settings.
+            Fit in seasonality-adjusted τ-time instead of raw clock time.
+        n_trials : int
+            Total Optuna trials (split across workers).
+        n_workers : int
+            Number of parallel worker processes.
         beta_min, beta_max : float
-            Search bounds for decay rates.
-        gof_dims : list[str]
-            Dimensions for GOF plots.
-        parallel_script : Path, optional
-            Path to run_optuna_parallel.py.  If None, attempts to locate it
-            relative to this file's directory.
+            Search bounds for the decay rates.
+        gof_dims : list[str], optional
+            Dimensions to render time-rescaling GOF plots for.
 
         Returns
         -------
-        dict with keys:
-            adjacency, baseline, decays — np.ndarrays
-            branching_ratio — float
-            score — float (per-event)
-            model — fitted HawkesExpKern
+        dict
+            Keys ``adjacency``, ``baseline``, ``decays``, ``branching_ratio``,
+            ``score`` (per-event), and the fitted ``model``.
         """
         os.environ["OMP_NUM_THREADS"] = "1"
 
@@ -1180,72 +977,49 @@ class HawkesCalibration:
         if gof_dims is None:
             gof_dims = []
 
-        # ── locate parallel script ───────────────────────────────
-        if parallel_script is None:
-            parallel_script = Path(__file__).resolve().parent / "run_optuna_parallel.py"
-        if not parallel_script.exists():
-            raise FileNotFoundError(
-                f"Cannot find {parallel_script}. Pass parallel_script= explicitly."
-            )
-
-        # ── serialise data ───────────────────────────────────────
-        data_dict = {
-            "beta_min": beta_min,
-            "beta_max": beta_max,
-            "n_nodes": self.n_nodes,
-            "marks_order": self.marks_order,
-            "MAX_ITER": self.max_iter,
-            "TOL": self.tol,
-            "events_dense": events,
-            "end_times_array": end_times,
-        }
-
-        tmp = Path(tempfile.gettempdir())
-        ts = int(_time.time())
-        data_file = tmp / f"optuna_data_{ts}.pkl"
-        output_file = tmp / f"optuna_results_{ts}.pkl"
-        study_name = f"hawkes_{label}_{ts}"
-
-        with open(data_file, "wb") as f:
-            pickle.dump(data_dict, f)
-
-        # ── launch parallel workers ──────────────────────────────
         print(f"\n{'='*60}")
-        print(f"Parallel Optuna ({label}): {n_trials} trials, {n_workers} workers")
+        print(f"Multivariate single-exp ({label}): "
+              f"{n_trials} trials, {n_workers} worker(s)")
         print(f"{'='*60}\n")
 
-        t0 = _time.time()
-        proc = subprocess.Popen(
-            [
-                sys.executable, str(parallel_script),
-                "--data-file", str(data_file),
-                "--output-file", str(output_file),
-                "--study-name", study_name,
-                "--n-jobs", str(n_workers),
-                "--n-trials", str(n_trials),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
-        )
-        for line in proc.stdout:
-            print(line, end="", flush=True)
-        if proc.wait() != 0:
-            raise RuntimeError("Parallel optimization failed")
-        elapsed = _time.time() - t0
-        print(f"\nCompleted in {elapsed:.1f}s")
+        if n_workers > 1:
+            data_dict = {
+                "beta_min": beta_min,
+                "beta_max": beta_max,
+                "n_nodes": self.n_nodes,
+                "marks_order": self.marks_order,
+                "max_iter": self.max_iter,
+                "tol": self.tol,
+                "events_dense": events,
+                "end_times_array": end_times,
+            }
+            opt_results = run_parallel_optuna(
+                data_dict,
+                objective_type="single",
+                n_workers=n_workers,
+                n_trials=n_trials,
+                study_name=f"hawkes_single_multi_{label}_{int(_time.time())}",
+            )
+            best_params = opt_results["best_params"]
+            if best_params is None:
+                raise RuntimeError(
+                    "Parallel optimisation failed: no trials completed"
+                )
+        else:
+            study = optuna.create_study(direction="maximize")
+            objective = _MutualObjective(
+                beta_min, beta_max, self.n_nodes, self.marks_order,
+                self.max_iter, self.tol, events, end_times,
+            )
+            study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+            best_params = study.best_params
 
-        # ── load best parameters ─────────────────────────────────
-        with open(output_file, "rb") as f:
-            opt_results = pickle.load(f)
-
-        best_params = opt_results["best_params"]
         best_decays = np.zeros((self.n_nodes, self.n_nodes))
         for i, di in enumerate(self.marks_order):
             for j, dj in enumerate(self.marks_order):
                 best_decays[i, j] = best_params[f"beta_{di}__{dj}"]
 
-        # ── refit ────────────────────────────────────────────────
+        # ── refit at best decays ──────────────────────────────────
         model = HawkesExpKern(
             decays=best_decays, max_iter=self.max_iter, tol=self.tol,
         )
@@ -1256,8 +1030,7 @@ class HawkesCalibration:
         br = float(max(np.linalg.eigvals(A).real))
         score = float(model.score(events=events, end_times=end_times))
 
-        print(f"\nBest score ({label}): {opt_results['best_value']}")
-        print(f"Branching ratio: {br:.4f}")
+        print(f"\nBranching ratio: {br:.4f}")
         print("\nAdjacency matrix:")
         print(pd.DataFrame(A, index=self.marks_order, columns=self.marks_order))
         print(f"\nDecay matrix ({label}):")
@@ -1285,16 +1058,6 @@ class HawkesCalibration:
             else:
                 print(f"No events for GOF: {dim_name}")
 
-        # ── cleanup temp files ───────────────────────────────────
-        try:
-            data_file.unlink()
-            output_file.unlink()
-            db_file = Path(f"{study_name}.db")
-            if db_file.exists():
-                db_file.unlink()
-        except Exception:
-            pass
-
         return {
             "adjacency": A,
             "baseline": baseline,
@@ -1305,259 +1068,97 @@ class HawkesCalibration:
         }
 
     # ══════════════════════════════════════════════════════════════
-    # 4.  Univariate Hawkes — double exponential (fixed β)
+    # 4.  Goodness-of-fit  (single-exponential, any dimension)
     # ══════════════════════════════════════════════════════════════
 
-    def fit_univariate_hawkes_double(
+    def goodness_of_fit(
         self,
+        dim_name: str,
+        adjacency: np.ndarray,
+        baseline: np.ndarray,
+        decays: np.ndarray,
         use_tau: bool = False,
-        gof_dims: Optional[List[str]] = None,
-        penalty: str = "l2",
-        C: float = 1e3,
-    ) -> dict:
-        """Fit independent univariate Hawkes per dimension (sum-of-two-exp).
+        title: Optional[str] = None,
+    ):
+        """Plot the time-rescaling GOF for one dimension of a single-exp fit.
 
-        Decays are FIXED to [BETA_FAST, BETA_SLOW].  Only baselines and the
-        two α coefficients per dimension are fitted.
+        The fitted compensator turns the dimension's events into interarrivals
+        that are Exponential(1) under a correct model. ``plot_time_rescaling_cdf``
+        then compares their empirical CDF against the 45-degree line with a KS
+        band.
 
-        Returns dict with keys:
-            df       — pd.DataFrame
-            models   — dict[dim_name → fitted HawkesSumExpKern]
-            total_ll, per_event_ll — floats
-        """
-        events, end_times = self._resolve_events(use_tau)
-        label = "τ-time" if use_tau else "raw"
-        if gof_dims is None:
-            gof_dims = []
-
-        decays_vec = np.array([self.BETA_FAST, self.BETA_SLOW])
-        results = []
-        models: Dict[str, object] = {}
-
-        for k, dim_name in enumerate(self.marks_order):
-            realizations = [day_seq[k] for day_seq in events]
-            total_ev = sum(len(s) for s in realizations)
-            if total_ev == 0:
-                continue
-
-            # HawkesSumExpKern expects list of list-of-arrays (multi-dim),
-            # but here each dim is fitted independently → 1-dimensional data.
-            ev_list = [
-                [np.ascontiguousarray(s, dtype=np.float64)]
-                for s in realizations if len(s) > 0
-            ]
-
-            learner = HawkesSumExpKern(
-                decays=decays_vec,
-                penalty=penalty,
-                C=C,
-                max_iter=self.max_iter,
-                tol=self.tol,
-                verbose=False,
-            )
-            learner.fit(ev_list)
-
-            bl = learner.baseline  # shape (1,)
-            adj = learner.adjacency  # shape (1, 1, 2) — α_fast, α_slow
-            mu_hat = float(bl[0])
-            alpha_fast = float(adj[0, 0, 0])
-            alpha_slow = float(adj[0, 0, 1])
-            # Kernel norm = sum of α_u (integral of each component is α_u)
-            kernel_norm = alpha_fast + alpha_slow
-
-            # Score (least-squares based — note: HawkesSumExpKern uses L2 loss,
-            # not log-likelihood, so `score` is -loss, not LL)
-            sc = float(learner.score())
-
-            models[dim_name] = learner
-
-            results.append({
-                "dim": dim_name,
-                "mu": mu_hat,
-                "alpha_fast": alpha_fast,
-                "alpha_slow": alpha_slow,
-                "kernel_norm": kernel_norm,
-                "beta_fast": self.BETA_FAST,
-                "beta_slow": self.BETA_SLOW,
-                "score": sc,
-                "n_events": total_ev,
-                "stable": kernel_norm < 1.0,
-            })
-
-        df = pd.DataFrame(results)
-        print(df)
-
-        total_sc = float((df["score"] * df["n_events"]).sum())
-        total_n = int(df["n_events"].sum())
-        per_ev = total_sc / total_n if total_n else np.nan
-
-        print(f"\nDouble-exp self-exciting total score ({label}):     {total_sc:.4f}")
-        print(f"Double-exp self-exciting per-event score ({label}): {per_ev:.6f}")
-
-        # ── GOF ──────────────────────────────────────────────────
-        for gof_dim in gof_dims:
-            if gof_dim not in models:
-                print(f"Model not found for {gof_dim}")
-                continue
-            lrn = models[gof_dim]
-            adj_3d = lrn.adjacency  # (1,1,2)
-            bl = lrn.baseline       # (1,)
-            dim_idx = self.marks_order.index(gof_dim)
-            s_list = []
-            for day_seq in events:
-                seq = day_seq[dim_idx]
-                if len(seq) > 0:
-                    s_day = compensator_interarrivals_double(
-                        [seq], decays_vec, adj_3d, bl,
-                    )[0]
-                    if len(s_day) > 0:
-                        s_list.append(s_day)
-            s_all = np.concatenate(s_list) if s_list else np.array([])
-            if len(s_all) > 0:
-                plot_time_rescaling_cdf(
-                    s_all, f"Double-exp self-exciting ({label}): {gof_dim}",
-                )
-            else:
-                print(f"No events for GOF: {gof_dim}")
-
-        return {
-            "df": df,
-            "models": models,
-            "total_ll": total_sc,
-            "per_event_ll": per_ev,
-        }
-
-    # ══════════════════════════════════════════════════════════════
-    # 5.  Multivariate Hawkes — double exponential (fixed β)
-    # ══════════════════════════════════════════════════════════════
-
-    def fit_multivariate_hawkes_double(
-        self,
-        use_tau: bool = False,
-        gof_dims: Optional[List[str]] = None,
-        penalty: str = "l2",
-        C: float = 1e3,
-    ) -> dict:
-        """Fit multivariate Hawkes with sum-of-two-exponential kernels.
-
-        Decays are FIXED to [BETA_FAST, BETA_SLOW].  The learner fits
-        baselines and the two α^u_{ij} matrices.
+        Parameters
+        ----------
+        dim_name : str
+            Dimension to evaluate.
+        adjacency : np.ndarray, shape (n_nodes, n_nodes)
+            Fitted adjacency ``α``.
+        baseline : np.ndarray, shape (n_nodes,)
+            Fitted baseline ``μ``.
+        decays : np.ndarray, shape (n_nodes, n_nodes)
+            Decay matrix ``β``.
+        use_tau : bool
+            Evaluate in τ-time instead of raw time.
+        title : str, optional
+            Plot title; a default is built from the dimension and time domain.
 
         Returns
         -------
-        dict with keys:
-            adjacency   — (n_nodes, n_nodes, 2)
-            baseline    — (n_nodes,)
-            decays      — [BETA_FAST, BETA_SLOW]
-            kernel_norms — (n_nodes, n_nodes) = sum over u of α^u
-            branching_ratio — float (spectral radius of kernel_norms)
-            score       — float
-            model       — fitted HawkesSumExpKern
+        np.ndarray
+            Concatenated compensator increments across days.
         """
-        events, end_times = self._resolve_events(use_tau)
+        events, _ = self._resolve_events(use_tau)
         label = "τ-time" if use_tau else "raw"
-        if gof_dims is None:
-            gof_dims = []
+        dim_idx = self.marks_order.index(dim_name)
 
-        decays_vec = np.array([self.BETA_FAST, self.BETA_SLOW])
+        s_list = []
+        for day_seq in events:
+            if len(day_seq[dim_idx]) == 0:
+                continue
+            s_day = compensator_interarrivals_single(
+                day_seq, np.asarray(decays), adjacency, baseline,
+            )[dim_idx]
+            if len(s_day) > 0:
+                s_list.append(s_day)
 
-        learner = HawkesSumExpKern(
-            decays=decays_vec,
-            penalty=penalty,
-            C=C,
-            max_iter=self.max_iter,
-            tol=self.tol,
-            verbose=False,
-        )
-        learner.fit(events)
-
-        bl = learner.baseline          # (n_nodes,)
-        adj = learner.adjacency        # (n_nodes, n_nodes, 2)
-        kernel_norms = adj.sum(axis=2)  # (n_nodes, n_nodes)
-        br = float(max(np.linalg.eigvals(kernel_norms).real))
-        sc = float(learner.score())
-
-        print(f"\nMultivariate double-exp Hawkes ({label})")
-        print(f"  Branching ratio: {br:.4f}")
-        print(f"  Score: {sc:.6f}")
-        print("\nBaseline:")
-        print(pd.Series(bl, index=self.marks_order, name="baseline"))
-        print("\nα_fast (β={:.0f}):".format(self.BETA_FAST))
-        print(pd.DataFrame(adj[:, :, 0], index=self.marks_order,
-                           columns=self.marks_order))
-        print("\nα_slow (β={:.0f}):".format(self.BETA_SLOW))
-        print(pd.DataFrame(adj[:, :, 1], index=self.marks_order,
-                           columns=self.marks_order))
-        print("\nKernel norms (α_fast + α_slow):")
-        print(pd.DataFrame(kernel_norms, index=self.marks_order,
-                           columns=self.marks_order))
-
-        # ── GOF ──────────────────────────────────────────────────
-        for dim_name in gof_dims:
-            dim_idx = self.marks_order.index(dim_name)
-            s_list = []
-            for day_seq in events:
-                if len(day_seq[dim_idx]) == 0:
-                    continue
-                s_day = compensator_interarrivals_double(
-                    day_seq, decays_vec, adj, bl,
-                )[dim_idx]
-                if len(s_day) > 0:
-                    s_list.append(s_day)
-            s_all = np.concatenate(s_list) if s_list else np.array([])
-            if len(s_all) > 0:
-                plot_time_rescaling_cdf(
-                    s_all,
-                    f"Double-exp Multivariate Hawkes ({label}): {dim_name}",
-                )
-            else:
-                print(f"No events for GOF: {dim_name}")
-
-        # ── visualise ────────────────────────────────────────────
-        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-
-        im0 = axes[0].imshow(adj[:, :, 0], cmap="viridis")
-        plt.colorbar(im0, ax=axes[0], label="α_fast")
-        axes[0].set_xticks(range(self.n_nodes))
-        axes[0].set_xticklabels(self.marks_order, rotation=45, ha="right")
-        axes[0].set_yticks(range(self.n_nodes))
-        axes[0].set_yticklabels(self.marks_order)
-        axes[0].set_title(f"α_fast (β={self.BETA_FAST})")
-
-        im1 = axes[1].imshow(adj[:, :, 1], cmap="viridis")
-        plt.colorbar(im1, ax=axes[1], label="α_slow")
-        axes[1].set_xticks(range(self.n_nodes))
-        axes[1].set_xticklabels(self.marks_order, rotation=45, ha="right")
-        axes[1].set_yticks(range(self.n_nodes))
-        axes[1].set_yticklabels(self.marks_order)
-        axes[1].set_title(f"α_slow (β={self.BETA_SLOW})")
-
-        im2 = axes[2].imshow(kernel_norms, cmap="viridis")
-        plt.colorbar(im2, ax=axes[2], label="kernel norm")
-        axes[2].set_xticks(range(self.n_nodes))
-        axes[2].set_xticklabels(self.marks_order, rotation=45, ha="right")
-        axes[2].set_yticks(range(self.n_nodes))
-        axes[2].set_yticklabels(self.marks_order)
-        axes[2].set_title("Kernel norms (α_fast + α_slow)")
-
-        fig.suptitle(f"Double-exp adjacency ({label})", fontsize=14)
-        fig.tight_layout()
-        plt.show()
-
-        return {
-            "adjacency": adj,
-            "baseline": bl,
-            "decays": decays_vec,
-            "kernel_norms": kernel_norms,
-            "branching_ratio": br,
-            "score": sc,
-            "model": learner,
-        }
+        s_all = np.concatenate(s_list) if s_list else np.array([])
+        if title is None:
+            title = f"GOF ({label}): {dim_name}"
+        if len(s_all) > 0:
+            plot_time_rescaling_cdf(s_all, title)
+        else:
+            print(f"No events for GOF: {dim_name}")
+        return s_all
 
     # ══════════════════════════════════════════════════════════════
-    # 6.  Univariate Hawkes — sum-of-exponentials (Optuna β search)
+    # 5.  Save / load calibration results
     # ══════════════════════════════════════════════════════════════
 
+    @staticmethod
+    def save_params(path: Union[str, Path], **kwargs):
+        """Pickle calibration results to *path*."""
+        path = Path(path)
+        with open(path, "wb") as f:
+            pickle.dump(kwargs, f)
+        print(f"Saved: {Path(path).name}")
+
+    @staticmethod
+    def load_params(path: Union[str, Path]) -> dict:
+        """Load pickled calibration results."""
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
+    # ══════════════════════════════════════════════════════════════
+    # TRIPLE KERNEL / QUINTET APPENDIX (experimental)
+    #
+    # Everything below fits sum-of-exponential ("triple") kernels via Optuna.
+    # It is the path used for the quintet calibration experiments. Nothing in
+    # the single-exponential production calibration above depends on it, so the
+        # whole block, these methods plus the module-level appendix at the end of
+        # the file, can be deleted in one go if the thesis stays single-exp.
+    # ══════════════════════════════════════════════════════════════
+
+    # Univariate: sum-of-exponentials (Optuna β search)
     def fit_univariate_hawkes_sumexp_optuna(
         self,
         use_tau: bool = False,
@@ -1610,8 +1211,8 @@ class HawkesCalibration:
                     )
                     et_list.append(et)
 
-            print(f"\n── {dim_name} ({total_ev:,} events), "
-                  f"{n_workers} worker(s) ──")
+            print(f"\n-- {dim_name} ({total_ev:,} events), "
+                  f"{n_workers} worker(s) --")
 
             if n_workers > 1:
                 data_dict = {
@@ -1713,7 +1314,7 @@ class HawkesCalibration:
             for day_seq in events:
                 seq = day_seq[dim_idx]
                 if len(seq) > 0:
-                    s_day = compensator_interarrivals_double(
+                    s_day = compensator_interarrivals_sumexp(
                         [seq], decays_vec, adj_3d, bl,
                     )[0]
                     if len(s_day) > 0:
@@ -1735,10 +1336,7 @@ class HawkesCalibration:
             "per_event_ll": per_ev,
         }
 
-    # ══════════════════════════════════════════════════════════════
-    # 7.  Multivariate Hawkes — sum-of-exponentials (Optuna β search)
-    # ══════════════════════════════════════════════════════════════
-
+    # Multivariate: sum-of-exponentials (Optuna β search)
     def fit_multivariate_hawkes_sumexp_optuna(
         self,
         use_tau: bool = False,
@@ -1866,16 +1464,16 @@ class HawkesCalibration:
 
         print(f"\nMultivariate {n_components}-exp Optuna Hawkes ({label})")
         if scale < 1.0:
-            print(f"  Raw ρ: {rho_raw:.4f} → scaled by {scale:.4f} to ρ={br:.4f}")
+            print(f"  Raw rho: {rho_raw:.4f} -> scaled by {scale:.4f} to rho={br:.4f}")
         print(f"  Branching ratio: {br:.4f}")
         print(f"  Score: {sc:.6f}")
         print("\nBaseline:")
         print(pd.Series(bl, index=self.marks_order, name="baseline"))
         for u in range(n_components):
-            print(f"\nα_{u} (β={best_betas[u]:.4f}):")
+            print(f"\nalpha_{u} (beta={best_betas[u]:.4f}):")
             print(pd.DataFrame(adj[:, :, u], index=self.marks_order,
                                columns=self.marks_order))
-        print("\nKernel norms (Σ α_u):")
+        print("\nKernel norms (sum of alpha_u):")
         print(pd.DataFrame(kernel_norms, index=self.marks_order,
                            columns=self.marks_order))
 
@@ -1886,7 +1484,7 @@ class HawkesCalibration:
             for day_seq in events:
                 if len(day_seq[dim_idx]) == 0:
                     continue
-                s_day = compensator_interarrivals_double(
+                s_day = compensator_interarrivals_sumexp(
                     day_seq, best_betas, adj, bl,
                 )[dim_idx]
                 if len(s_day) > 0:
@@ -1939,87 +1537,224 @@ class HawkesCalibration:
             "best_betas": best_betas,
         }
 
-    # ══════════════════════════════════════════════════════════════
-    # 8.  Goodness-of-fit  (standalone, any model)
-    # ══════════════════════════════════════════════════════════════
 
-    def goodness_of_fit(
-        self,
-        dim_name: str,
-        adjacency: np.ndarray,
-        baseline: np.ndarray,
-        decays,
-        use_tau: bool = False,
-        title: Optional[str] = None,
-    ):
-        """Compute and plot compensator-based GOF for a single dimension.
+# ═══════════════════════════════════════════════════════════════════════════════
+# TRIPLE KERNEL / QUINTET APPENDIX (experimental)
+#
+# Sum-of-exponential objectives and the matching compensator, used only by the
+# fit_*_sumexp_optuna methods above. Kept at module level and at the bottom of
+# the file so the triple-kernel path can be deleted in one block. The
+# single-exponential production calibration does not touch anything here.
+# ═══════════════════════════════════════════════════════════════════════════════
 
-        Parameters
-        ----------
-        dim_name : str
-            Which dimension to evaluate.
-        adjacency : np.ndarray
-            For single-exp: (n_nodes, n_nodes).
-            For double-exp: (n_nodes, n_nodes, U).
-        baseline : np.ndarray, shape (n_nodes,)
-        decays :
-            For single-exp: (n_nodes, n_nodes) matrix.
-            For double-exp: 1-D array of length U.
-        use_tau : bool
-        title : str, optional
 
-        Returns
-        -------
-        s_all : np.ndarray  — concatenated compensator increments
-        """
-        events, _ = self._resolve_events(use_tau)
-        label = "τ-time" if use_tau else "raw"
-        dim_idx = self.marks_order.index(dim_name)
+def compensator_interarrivals_sumexp(
+    day_sequences: list,
+    decays: np.ndarray,
+    adjacency: np.ndarray,
+    baseline: np.ndarray,
+) -> list:
+    """Compensator interarrivals for sum-of-exponential kernels.
 
-        is_double = (np.ndim(decays) == 1 and len(decays) > 1) or \
-                    (np.ndim(adjacency) == 3)
+    Works for any number of components ``U`` (``U = 3`` for the triple kernel).
+    The kernel from source ``j`` to target ``i`` is
+    ``φ_ij(t) = Σ_u α^u_ij β^u exp(−β^u t)``.
 
-        s_list = []
-        for day_seq in events:
-            if len(day_seq[dim_idx]) == 0:
-                continue
-            if is_double:
-                s_day = compensator_interarrivals_double(
-                    day_seq, np.asarray(decays), adjacency, baseline,
-                )[dim_idx]
+    Parameters
+    ----------
+    day_sequences : list of np.ndarray
+        One event-time array per dimension, for a single day.
+    decays : np.ndarray, shape (U,)
+        Decay rates ``β^u``.
+    adjacency : np.ndarray, shape (n_nodes, n_nodes, U)
+        Component adjacencies ``α^u_ij``.
+    baseline : np.ndarray, shape (n_nodes,)
+        Baseline intensities ``μ``.
+
+    Returns
+    -------
+    list of np.ndarray
+        Compensator increments per dimension; Exponential(1) under a good fit.
+    """
+    n_nodes = len(day_sequences)
+    U = len(decays)
+
+    all_times = np.concatenate(day_sequences) if day_sequences else np.array([])
+    if len(all_times) == 0:
+        return [np.array([]) for _ in range(n_nodes)]
+
+    marks = np.concatenate([
+        np.full(len(seq), idx, dtype=np.int64)
+        for idx, seq in enumerate(day_sequences)
+    ])
+
+    order = np.argsort(all_times)
+    sorted_t = all_times[order]
+    sorted_m = marks[order]
+
+    # kernel_state[u, i, j]: auxiliary state for decay u, target i, source j
+    kernel_state = np.zeros((U, n_nodes, n_nodes), dtype=np.float64)
+    comp = np.zeros(n_nodes, dtype=np.float64)
+    last_comp = np.zeros(n_nodes, dtype=np.float64)
+    increments: List[list] = [[] for _ in range(n_nodes)]
+
+    prev_t = 0.0
+    idx = 0
+    while idx < len(sorted_t):
+        cur_t = sorted_t[idx]
+        dt = cur_t - prev_t
+        if dt > 0:
+            comp += baseline * dt
+            for u in range(U):
+                beta_u = decays[u]
+                decay_f = np.exp(-beta_u * dt)
+                # ∫₀^dt kernel_state · exp(−β t') dt' = kernel_state · (1 − e^{−β dt}) / β
+                comp += (kernel_state[u] * (1.0 - decay_f) / beta_u).sum(axis=1)
+                kernel_state[u] *= decay_f
+
+        start = idx
+        while start < len(sorted_t) and sorted_t[start] == cur_t:
+            d = sorted_m[start]
+            increments[d].append(comp[d] - last_comp[d])
+            last_comp[d] = comp[d]
+            start += 1
+
+        while idx < start:
+            src = sorted_m[idx]
+            for u in range(U):
+                kernel_state[u, :, src] += adjacency[:, src, u] * decays[u]
+            idx += 1
+
+        prev_t = cur_t
+
+    return [np.array(inc) for inc in increments]
+
+
+class _SumExpSelfObjective:
+    """Optuna objective for univariate sum-of-exponentials Hawkes.
+
+    Searches over N shared decay rates (one per component), ordered
+    fastest-to-slowest.  Each beta_i is drawn from its own range.
+    """
+
+    def __init__(self, beta_ranges, penalty, C,
+                 max_iter, tol, events, end_times):
+        self.beta_ranges = beta_ranges
+        self.penalty = penalty
+        self.C = C
+        self.max_iter = max_iter
+        self.tol = tol
+        self.events = events
+        self.end_times = end_times
+
+    def __call__(self, trial):
+        betas = []
+        for idx, (lo, hi) in enumerate(self.beta_ranges):
+            betas.append(trial.suggest_float(
+                f"beta_{idx}", lo, hi, log=True,
+            ))
+        if sorted(betas, reverse=True) != betas:
+            return -np.inf
+
+        decays = np.array(betas)
+        learner = HawkesSumExpKern(
+            decays=decays, penalty=self.penalty, C=self.C,
+            max_iter=self.max_iter, tol=self.tol, verbose=False,
+        )
+        try:
+            learner.fit(self.events)
+            kernel_norm = float(learner.adjacency.sum())
+            if kernel_norm >= 1.0:
+                return -np.inf
+            score = float(learner.score(
+                events=self.events, end_times=self.end_times,
+            ))
+        except Exception as e:
+            print("CRASH:", e, flush=True)
+            raise
+        return score
+
+
+class _SumExpObjective:
+    """Optuna objective for multivariate sum-of-exponentials Hawkes.
+
+    Searches over N shared decay rates (one per component), ordered
+    fastest-to-slowest.  Each beta_i is drawn from its own range.
+
+    Supercritical kernels (spectral radius > ``rho_target``) are scaled
+    down to exactly ``rho_target`` before scoring, so the log-likelihood
+    reflects the fit quality of the model that will actually be used in
+    simulation.
+
+    Parameters
+    ----------
+    slow_self_floor : dict or None
+        Soft penalty ensuring the slowest kernel carries a minimum fraction
+        of each specified dimension's self-excitation.
+        Keys: ``"dims"`` (list of int) and ``"r_target"`` (float, e.g. 0.20).
+        Penalty per dimension: ``max(0, r_target / r - 1)`` where
+        ``r = α_slow[dim,dim] / Σ_k α_k[dim,dim]``.
+    rho_target : float
+        Target spectral radius.  Kernels with ρ > rho_target are scaled
+        to this value before the score is computed.
+    """
+
+    def __init__(self, beta_ranges, penalty, C,
+                 max_iter, tol, events, end_times,
+                 slow_self_floor=None, rho_target=0.95):
+        self.beta_ranges = beta_ranges
+        self.penalty = penalty
+        self.C = C
+        self.max_iter = max_iter
+        self.tol = tol
+        self.events = events
+        self.end_times = end_times
+        self.slow_self_floor = slow_self_floor
+        self.rho_target = rho_target
+
+    def __call__(self, trial):
+        betas = []
+        for idx, (lo, hi) in enumerate(self.beta_ranges):
+            betas.append(trial.suggest_float(
+                f"beta_{idx}", lo, hi, log=True,
+            ))
+        if sorted(betas, reverse=True) != betas:
+            return -np.inf
+
+        decays = np.array(betas)
+        learner = HawkesSumExpKern(
+            decays=decays, penalty=self.penalty, C=self.C,
+            max_iter=self.max_iter, tol=self.tol, verbose=False,
+        )
+        try:
+            learner.fit(self.events)
+            adj = learner.adjacency
+            kernel_norms = adj.sum(axis=2)
+            rho = float(max(np.linalg.eigvals(kernel_norms).real))
+
+            if rho > self.rho_target:
+                scaled_adj = adj * (self.rho_target / rho)
             else:
-                s_day = compensator_interarrivals_single(
-                    day_seq, np.asarray(decays), adjacency, baseline,
-                )[dim_idx]
-            if len(s_day) > 0:
-                s_list.append(s_day)
+                scaled_adj = adj
 
-        s_all = np.concatenate(s_list) if s_list else np.array([])
+            score = float(learner.score(
+                events=self.events, end_times=self.end_times,
+                adjacency=scaled_adj,
+            ))
+        except Exception as e:
+            print("CRASH:", e, flush=True)
+            raise
 
-        if title is None:
-            title = f"GOF ({label}): {dim_name}"
-
-        if len(s_all) > 0:
-            plot_time_rescaling_cdf(s_all, title)
-        else:
-            print(f"No events for GOF: {dim_name}")
-
-        return s_all
-
-    # ══════════════════════════════════════════════════════════════
-    # 9.  Convenience: save / load results
-    # ══════════════════════════════════════════════════════════════
-
-    @staticmethod
-    def save_params(path: Union[str, Path], **kwargs):
-        """Pickle calibration results to *path*."""
-        path = Path(path)
-        with open(path, "wb") as f:
-            pickle.dump(kwargs, f)
-        print(f"Saved: {Path(path).name}")
-
-    @staticmethod
-    def load_params(path: Union[str, Path]) -> dict:
-        """Load pickled calibration results."""
-        with open(path, "rb") as f:
-            return pickle.load(f)
+        if self.slow_self_floor is not None:
+            r_target = self.slow_self_floor["r_target"]
+            for dim in self.slow_self_floor["dims"]:
+                total = adj[dim, dim, :].sum()
+                if total > 0:
+                    r = adj[dim, dim, -1] / total
+                    if r > 0:
+                        score -= max(0.0, (r_target / r) - 1.0)
+                    else:
+                        score -= 100.0
+        beta_str = ", ".join(f"beta_{i}={b:.4f}" for i, b in enumerate(betas))
+        print(f"Trial {trial.number} -> {score:.6f}  (rho={rho:.4f}, {beta_str})")
+        return score

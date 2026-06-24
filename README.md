@@ -4,7 +4,7 @@ This repository provides the simulation, calibration, and analysis toolkit for s
 
 ## Overview
 
-- **Simulation** (`classes/simulate.py`) -- Event-driven LOB simulator with Hawkes process arrivals (Poisson, univariate self-exciting, and multivariate mutually exciting models). Supports single-exponential and triple-exponential (sum of three exponentials) kernels, empirical order placement and cancellation distributions, and full book state recording to SQLite.
+- **Simulation** (`classes/simulate.py`) -- Event-driven LOB simulator with Hawkes process arrivals (Poisson, univariate self-exciting, multivariate mutually exciting). Single- and triple-exponential kernels, empirical placement/cancellation distributions. Three recording modes (`recording_mode`): `'full'` (all SQLite tables), `'medium'` (`bbo` + `mo_orders` only), `'lightweight'` (in-memory only, no SQLite).
 - **Calibration** (`classes/calibrate.py`) - Hawkes process parameter estimation via MLE with Optuna optimisation. Handles seasonality adjustment (raw time and tau-time), goodness-of-fit testing via the time-rescaling theorem, and parallel multi-worker calibration.
 - **Order book** (`classes/orderbook.py`) - Heap-based order book implementation optimised for efficient simulation.
 - **Extraction** (`classes/extract.py`) - Transforms raw WSE HDF5 order and trade data into structured SQLite databases with full book state snapshots at each event.
@@ -49,6 +49,7 @@ sim = Simulate(
     T=184300,
     kernel_mode="triple",
     db_path="sim_events.sqlite",
+    recording_mode="medium",   # 'full' | 'medium' | 'lightweight'
 )
 sim.load_real_orderbook_snapshot(
     asset="KGHM",
@@ -67,7 +68,7 @@ from pathlib import Path
 run_full_extraction(
     asset="KGHM",
     orders_h5=Path("data/WSELOB-2017/orders/KGHM_lob_2017_zlib.h5"),
-    trades_h5=Path("data/WSELOB-2017/trades/KGHM_lob_2017_zlib.h5"),
+    trades_h5=Path("data/WSELOB-2017/trades/KGHM_trades_2017_zlib.h5"),
     db_path=Path("data/KGHM_order_flow.sqlite"),
 )
 ```
@@ -171,7 +172,7 @@ Aggregated market-order records. One row per market order (which may comprise mu
 | `best_bid` | REAL | Best bid before execution |
 | `best_ask` | REAL | Best ask before execution |
 | `ticks_walked` | INTEGER | Price levels consumed beyond BBO |
-| `ratio_L0` | REAL | `mo_volume / L0_depth` — fraction of top-of-book consumed |
+| `ratio_L0` | REAL | `mo_volume / L0_depth`; fraction of top-of-book consumed |
 | `microprice` | REAL | Microprice before execution |
 | `opp_depth_L0..L9` | REAL | Opposite-side depth at 10 levels |
 | `bid_depth_L0..L4` | REAL | Bid depth at 5 levels |
@@ -183,7 +184,15 @@ Aggregated market-order records. One row per market order (which may comprise mu
 
 Produced by `Simulate.run()` when a `db_path` is supplied. Each run creates a fresh SQLite file. The database uses WAL journaling and `PRAGMA synchronous=NORMAL` for write performance, and creates timestamp indices on close.
 
-#### Table: `orders`
+The tables written depend on `recording_mode`:
+
+| Mode | Tables | Use case |
+|------|--------|----------|
+| `'full'` (default) | `orders`, `fills`, `mo_orders`, `bbo`, `intensities` | Event-level analysis, order placement studies |
+| `'medium'` | `mo_orders`, `bbo` | Stylised-facts analysis at reduced storage and compute |
+| `'lightweight'` | *(none)* | Parallel batch runs; in-memory results via `get_compact_results()` |
+
+#### Table: `orders` *(full mode only)*
 
 Mirrors the empirical `orders` table with simulation-native types. The `day` column is dropped (simulations have no day boundaries) and `timestamp` is `REAL` (Hawkes process time, not wall-clock).
 
@@ -224,7 +233,7 @@ Mirrors the empirical `orders` table with simulation-native types. The `day` col
 
 **Index:** `idx_orders_ts ON orders(timestamp)`
 
-#### Table: `fills`
+#### Table: `fills` *(full mode only)*
 
 One row per fill from a simulated market order.
 
@@ -244,7 +253,7 @@ One row per fill from a simulated market order.
 
 **Index:** `idx_fills_ts ON fills(timestamp)`
 
-#### Table: `mo_orders`
+#### Table: `mo_orders` *(full and medium modes)*
 
 Aggregated market orders. Drops `day`, `first_time_ns`, and `cls_method` relative to the empirical schema.
 
@@ -267,9 +276,9 @@ Aggregated market orders. Drops `day`, `first_time_ns`, and `cls_method` relativ
 
 **Index:** `idx_mo_ts ON mo_orders(timestamp)`
 
-#### Table: `bbo`
+#### Table: `bbo` *(full and medium modes)*
 
-Lightweight best-bid/offer snapshot recorded on every event (including events that do not produce an `orders` row).
+Best-bid/offer snapshot recorded on every event (including events that do not produce an `orders` row).
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -280,7 +289,7 @@ Lightweight best-bid/offer snapshot recorded on every event (including events th
 
 **Index:** `idx_bbo_ts ON bbo(timestamp)`
 
-#### Table: `intensities`
+#### Table: `intensities` *(full mode only)*
 
 Hawkes process intensity snapshot at each event time.
 

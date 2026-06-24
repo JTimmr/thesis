@@ -16,6 +16,7 @@ dependencies = [
     "optuna>=3.0",
     "sortedcontainers>=2.4",
     "tick>=0.7",
+    "numba>=0.56",
 ]
 
 # This directory is the repo root; the import name is still ``research_core``.
@@ -25,5 +26,6 @@ packages = [
     "research_core",
     "research_core.classes",
     "research_core.data",
+    "research_core.scripts",
     "research_core.validation",
 ]

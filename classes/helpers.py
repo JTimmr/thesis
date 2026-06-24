@@ -1,4 +1,23 @@
-"""Shared paths and SQLite extraction helpers for calibration."""
+"""Shared paths and SQLite loaders for Hawkes calibration.
+
+This module sits between the SQLite databases produced by ``extract`` and the
+fitting code in ``calibrate``. It resolves data paths, lists trading days,
+loads per-mark event times into the ``list[list[np.ndarray]]`` layout the
+calibrator expects, and estimates the intraday seasonality profiles used to
+build τ-time. ``plot_mm_result_compact`` is an unrelated plotting helper kept
+here because the market-maker notebooks import it.
+
+SQLite contract
+---------------
+The loaders assume the schema written by ``research_core.classes.extract``:
+
+- ``mo_orders(day, first_time_ns, side)`` with ``side`` in {'buy', 'sell'};
+  ``MO_bid`` maps to buy market orders, ``MO_ask`` to sell.
+- ``orders(day, timestamp, event_type, side)`` with ``event_type`` in
+  {'LO', 'CXL'} and integer ``side`` in {1 = bid, 2 = ask}.
+
+Event times are returned as seconds since the day's market open.
+"""
 
 from __future__ import annotations
 
@@ -43,8 +62,6 @@ def resolve_data_path(path: Union[str, Path]) -> Path:
     if p.is_absolute():
         return p
     return data_dir() / p
-
-
 
 
 def load_day_events_from_sqlite(
@@ -339,6 +356,7 @@ def estimate_seasonality_profiles(
     marks_order: Sequence[str],
     end_times: Sequence[float],
     *,
+    day_keys: Optional[Sequence[str]] = None,
     bandwidth: float = 300.0,
     grid_points: int = 400,
     cache_path: Optional[Union[str, Path]] = None,
@@ -346,12 +364,36 @@ def estimate_seasonality_profiles(
 ) -> dict:
     """Estimate intraday seasonality profiles for each event type.
 
-    Returns a dict mapping each dimension name to a 4-tuple:
-    ``(grid, mean_profile, day_profiles_dict, computed_day_keys)``.
+    Returns a dict mapping each dimension name to a 4-tuple
+    ``(grid, mean_profile, day_profiles_dict, day_keys)``, where
+    ``day_profiles_dict`` is keyed by the trading-day labels.
 
-    Results are cached to *cache_path* (pickle) when provided.
+    Parameters
+    ----------
+    timestamps_by_day, marks_order, end_times :
+        Per-day, per-mark event times; dimension names; per-day horizons.
+    day_keys : sequence of str, optional
+        Trading-day labels (e.g. ``"d20170111"``), aligned with
+        ``timestamps_by_day``. When omitted, positional ``"day_{i}"`` labels
+        are used. Passing the real keys keeps the per-day profiles traceable
+        back to specific sessions.
+    bandwidth, grid_points :
+        Epanechnikov bandwidth (seconds) and number of grid points.
+    cache_path : path, optional
+        Pickle results here, and reload them on the next call unless
+        ``force_recompute`` is set.
     """
     marks_order = list(marks_order)
+
+    if day_keys is None:
+        day_keys_list = [f"day_{i}" for i in range(len(timestamps_by_day))]
+    else:
+        day_keys_list = list(day_keys)
+        if len(day_keys_list) != len(timestamps_by_day):
+            raise ValueError(
+                "day_keys length does not match timestamps_by_day "
+                f"({len(day_keys_list)} vs {len(timestamps_by_day)})"
+            )
 
     # ── Try loading from cache ─────────────────────────────────────────
     if cache_path is not None:
@@ -383,7 +425,6 @@ def estimate_seasonality_profiles(
     T_max = float(np.max(end_times)) if len(end_times) else 28200.0
     grid = np.linspace(0, T_max, grid_points)
 
-    day_keys_list = [f"day_{i}" for i in range(len(timestamps_by_day))]
     seasonality_profiles: Dict[str, tuple] = {}
 
     for dim_idx, dim_name in enumerate(marks_order):
