@@ -36,8 +36,19 @@ import matplotlib.pyplot as plt
 
 
 def project_root() -> Path:
-    """Return the repository root (this package lives directly under it)."""
-    return Path(__file__).resolve().parents[1]
+    """Return the repository root, independent of the checkout folder name.
+
+    Walks upward from this file until it finds stable repository markers
+    (``pyproject.toml`` alongside the ``classes`` package directory). This
+    works whether the clone is named ``research_core``, ``thesis``, or
+    anything else. The current working directory is never used, so notebooks
+    launched from arbitrary folders still resolve the correct root.
+    """
+    path = Path(__file__).resolve()
+    for parent in path.parents:
+        if (parent / "pyproject.toml").exists() and (parent / "classes").exists():
+            return parent
+    raise RuntimeError("Could not locate repository root from helpers.py")
 
 
 def data_dir() -> Path:
