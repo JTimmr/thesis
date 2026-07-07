@@ -8,8 +8,7 @@ the shared store. Pickling the objective directly would drag the whole event
 dataset across the process boundary, so the coordinator passes a data file.
 
 ``run_parallel_optuna`` is the coordinator, called from ``HawkesCalibration``
-for the single-exponential (``"single"``) path and the sum-exp appendix
-(``"sumexp"`` / ``"sumexp_self"``). The module also serves as the worker entry
+for the single-exponential (``"single"``) path. The module also serves as the worker entry
 point::
 
     python -m research_core.classes.parallelisation \
@@ -28,7 +27,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time as _time
+import time
 import traceback
 from pathlib import Path
 from typing import Dict, Optional
@@ -40,11 +39,9 @@ from optuna.storages import RDBStorage
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Worker functions: each runs inside a fresh subprocess
-# ═══════════════════════════════════════════════════════════════════════════════
+# --- Worker functions ---
 
-def _create_objective(objective_type: str, data: dict):
+def create_objective(objective_type: str, data: dict):
     """Instantiate the right Optuna objective from *data*.
 
     Imports from ``calibrate`` are deferred to avoid a circular import
@@ -52,8 +49,8 @@ def _create_objective(objective_type: str, data: dict):
     worker subprocesses, where the circular import cannot occur.
     """
     if objective_type == "single":
-        from research_core.classes.calibrate import _MutualObjective
-        return _MutualObjective(
+        from research_core.classes.calibrate import MultivariateHawkesObjective
+        return MultivariateHawkesObjective(
             beta_min=data["beta_min"],
             beta_max=data["beta_max"],
             n_nodes=data["n_nodes"],
@@ -64,56 +61,21 @@ def _create_objective(objective_type: str, data: dict):
             end_times=data["end_times_array"],
         )
 
-    # Triple-kernel (sum-exp) objectives: experimental appendix.
-    # Used only by HawkesCalibration.fit_*_sumexp_optuna; remove together with
-    # the rest of the triple-kernel path.
-    if objective_type == "sumexp":
-        from research_core.classes.calibrate import _SumExpObjective
-        return _SumExpObjective(
-            beta_ranges=data["beta_ranges"],
-            penalty=data["penalty"],
-            C=data["C"],
-            max_iter=data["max_iter"],
-            tol=data["tol"],
-            events=data["events"],
-            end_times=data["end_times"],
-            slow_self_floor=data.get("slow_self_floor"),
-            rho_target=data.get("rho_target", 0.95),
-        )
-
-    if objective_type == "sumexp_self":
-        from research_core.classes.calibrate import _SumExpSelfObjective
-        return _SumExpSelfObjective(
-            beta_ranges=data["beta_ranges"],
-            penalty=data["penalty"],
-            C=data["C"],
-            max_iter=data["max_iter"],
-            tol=data["tol"],
-            events=data["events"],
-            end_times=data["end_times"],
-        )
-
     raise ValueError(f"Unknown objective_type: {objective_type!r}")
 
 
-def _run_worker(
-    storage_url: str,
-    study_name: str,
-    data_file: str,
-    objective_type: str,
-    n_trials: int,
-):
+def run_worker(storage_url: str, study_name: str, data_file: str, objective_type: str, n_trials: int):
     """Load data, build objective, run trials against the shared study."""
     with open(data_file, "rb") as f:
         data = pickle.load(f)
 
-    objective = _create_objective(objective_type, data)
+    objective = create_objective(objective_type, data)
 
     study = optuna.load_study(study_name=study_name, storage=storage_url)
     study.optimize(objective, n_trials=n_trials, n_jobs=1)
 
 
-def _read_worker_stdout(worker_id: int, process, out_q: queue.Queue) -> None:
+def read_worker_stdout(worker_id: int, process, out_q: queue.Queue) -> None:
     """Copy one worker's stdout into the coordinator queue."""
     try:
         if process.stdout is None:
@@ -124,17 +86,9 @@ def _read_worker_stdout(worker_id: int, process, out_q: queue.Queue) -> None:
         out_q.put((worker_id, None))
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Coordinator: called from the main process (e.g. calibrate.py)
-# ═══════════════════════════════════════════════════════════════════════════════
+# --- Coordinator ---
 
-def run_parallel_optuna(
-    data_dict: dict,
-    objective_type: str,
-    n_workers: int,
-    n_trials: int,
-    study_name: Optional[str] = None,
-) -> dict:
+def run_parallel_optuna(data_dict: dict, objective_type: str, n_workers: int, n_trials: int, study_name: Optional[str] = None) -> dict:
     """Run an Optuna study across *n_workers* subprocesses.
 
     Parameters
@@ -142,8 +96,7 @@ def run_parallel_optuna(
     data_dict : dict
         Serialisable keyword arguments for the objective constructor.
     objective_type : str
-        ``"single"`` (production single-exponential), or the sum-exp appendix
-        types ``"sumexp"`` / ``"sumexp_self"``.
+        ``"single"`` (production single-exponential).
     n_workers : int
         Number of parallel worker processes.
     n_trials : int
@@ -155,13 +108,13 @@ def run_parallel_optuna(
     -------
     dict with ``best_params`` (dict) and ``best_value`` (float).
     """
-    tmp = Path(tempfile.gettempdir())
-    ts = int(_time.time() * 1000)
+    temp_dir = Path(tempfile.gettempdir())
+    ts = int(time.time() * 1000)
     if study_name is None:
         study_name = f"hawkes_{objective_type}_{ts}"
 
-    data_file = tmp / f"optuna_data_{ts}.pkl"
-    db_path = tmp / f"{study_name}.db"
+    data_file = temp_dir / f"optuna_data_{ts}.pkl"
+    db_path = temp_dir / f"{study_name}.db"
     storage_url = f"sqlite:///{db_path}"
 
     with open(data_file, "wb") as f:
@@ -209,7 +162,7 @@ def run_parallel_optuna(
 
     for wid, proc in processes:
         t = threading.Thread(
-            target=_read_worker_stdout,
+            target=read_worker_stdout,
             args=(wid, proc, out_q),
             daemon=True,
         )
@@ -252,17 +205,12 @@ def run_parallel_optuna(
 
     # Cleanup.
     for p in (data_file, db_path):
-        try:
-            p.unlink()
-        except Exception:
-            pass
+        p.unlink(missing_ok=True)
 
     return results
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CLI entry point for worker subprocesses
-# ═══════════════════════════════════════════════════════════════════════════════
+# --- CLI entry point ---
 
 def _main():
     parser = argparse.ArgumentParser()
@@ -278,7 +226,7 @@ def _main():
     print(f"Worker {args.worker_id} starting "
           f"({args.n_trials} trials, {args.objective_type})", flush=True)
     try:
-        _run_worker(
+        run_worker(
             args.storage_url, args.study_name,
             args.data_file, args.objective_type, args.n_trials,
         )
