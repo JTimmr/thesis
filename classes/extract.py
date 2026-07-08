@@ -28,28 +28,28 @@ from ..data.schema import (
     _ORDERS_N_BASE_COLS,
 )
 
-TZ = "Europe/Warsaw"
+warsaw_tz = "Europe/Warsaw"
 
-_N_ORDER_COLS = _ORDERS_N_BASE_COLS + 2 * ORDERS_DEPTH_LEVELS
-_INSERT_ORDERS_SQL = (
-    "INSERT INTO orders VALUES (" + ",".join(["?"] * _N_ORDER_COLS) + ")"
+n_order_cols = _ORDERS_N_BASE_COLS + 2 * ORDERS_DEPTH_LEVELS
+insert_orders_sql = (
+    "INSERT INTO orders VALUES (" + ",".join(["?"] * n_order_cols) + ")"
 )
 
-_N_FILL_COLS = 30
-_INSERT_FILLS_SQL = (
-    "INSERT INTO fills VALUES (" + ",".join(["?"] * _N_FILL_COLS) + ")"
+n_fill_cols = 30
+insert_fills_sql = (
+    "INSERT INTO fills VALUES (" + ",".join(["?"] * n_fill_cols) + ")"
 )
 
-_N_MO_COLS = 33
-_INSERT_MO_SQL = (
-    "INSERT INTO mo_orders VALUES (" + ",".join(["?"] * _N_MO_COLS) + ")"
+n_mo_cols = 33
+insert_mo_sql = (
+    "INSERT INTO mo_orders VALUES (" + ",".join(["?"] * n_mo_cols) + ")"
 )
 
-_CLS_KEYS = [
+lee_ready_counter_keys = [
     "quote_sell", "quote_buy", "mid_sell", "mid_buy",
     "tick_used", "last_side_fallback", "unclassified",
 ]
-_CLS_MAP = {
+lee_ready_rule_map = {
     "quote_sell": "quote", "quote_buy": "quote",
     "mid_sell": "midpoint", "mid_buy": "midpoint",
     "tick_used": "tick",
@@ -58,9 +58,7 @@ _CLS_MAP = {
 }
 
 
-# ─────────────────────────────────────────────────────────────
-# Data loading helpers
-# ─────────────────────────────────────────────────────────────
+# --- Data loading helpers ---
 
 def list_day_keys_hdf(orders_file: Path) -> list:
     """Return sorted day keys stored in the HDF5 orders file."""
@@ -73,9 +71,9 @@ def load_orders_day(orders_file: Path, day_key: str) -> pd.DataFrame:
     """Load and normalize one day of orders data."""
     df = pd.read_hdf(str(orders_file), f"/{day_key}")
     df = df.copy()
-    df["time"] = pd.to_datetime(df["time"], unit="ns", utc=True).dt.tz_convert(TZ)
-    df["priority_date"] = pd.to_datetime(df["priority_date"], unit="ns", utc=True).dt.tz_convert(TZ)
-    df["order_date"] = pd.to_datetime(df["order_date"], unit="ns", utc=True).dt.tz_convert(TZ)
+    df["time"] = pd.to_datetime(df["time"], unit="ns", utc=True).dt.tz_convert(warsaw_tz)
+    df["priority_date"] = pd.to_datetime(df["priority_date"], unit="ns", utc=True).dt.tz_convert(warsaw_tz)
+    df["order_date"] = pd.to_datetime(df["order_date"], unit="ns", utc=True).dt.tz_convert(warsaw_tz)
     df["price"] = df["price"] / (10 ** df["price_level"])
     df["action_type"] = df["action_type"].astype(str)
     df["order_type"] = df["order_type"].astype(str)
@@ -87,8 +85,8 @@ def load_trades_day(trades_file: Path, day_key: str, time_field: str) -> pd.Data
     """Load and normalize one day of trades data."""
     df = pd.read_hdf(str(trades_file), f"/{day_key}")
     df = df.copy()
-    df["time"] = pd.to_datetime(df["time"], unit="ns", utc=True).dt.tz_convert(TZ)
-    df["trading_datetime"] = pd.to_datetime(df["trading_datetime"], unit="ns", utc=True).dt.tz_convert(TZ)
+    df["time"] = pd.to_datetime(df["time"], unit="ns", utc=True).dt.tz_convert(warsaw_tz)
+    df["trading_datetime"] = pd.to_datetime(df["trading_datetime"], unit="ns", utc=True).dt.tz_convert(warsaw_tz)
     df["price_float"] = df["price"] / (10 ** df["price_level"])
     df["trade_time"] = df[time_field]
 
@@ -104,7 +102,7 @@ def filter_market_hours(df: pd.DataFrame, market_open: str, market_close: str, t
     """Filter records to the market open/close interval (local time)."""
     if market_open is None or market_close is None:
         return df
-    local_time = df[time_col].dt.tz_convert(TZ)
+    local_time = df[time_col].dt.tz_convert(warsaw_tz)
     start = local_time.dt.normalize() + pd.to_timedelta(market_open)
     end = local_time.dt.normalize() + pd.to_timedelta(market_close)
     return df[(local_time >= start) & (local_time <= end)]
@@ -120,9 +118,7 @@ def to_seconds_since(ts: pd.Series, ref_time: pd.Timestamp) -> np.ndarray:
     return (values - ref).astype("float64") / 1e9
 
 
-# ─────────────────────────────────────────────────────────────
-# Lee–Ready trade classification
-# ─────────────────────────────────────────────────────────────
+# --- Lee-Ready trade classification ---
 
 def infer_trade_side(
     trade_price,
@@ -266,8 +262,8 @@ def summarize_side_stats(side_stats: dict) -> pd.DataFrame:
     """
     n_trades = side_stats.get("n_trades", 0)
     by_rule: dict = {}
-    for key in _CLS_KEYS:
-        rule = _CLS_MAP[key]
+    for key in lee_ready_counter_keys:
+        rule = lee_ready_rule_map[key]
         by_rule[rule] = by_rule.get(rule, 0) + side_stats.get(key, 0)
 
     rows = [
@@ -281,9 +277,7 @@ def summarize_side_stats(side_stats: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# ─────────────────────────────────────────────────────────────
-# Order book helpers
-# ─────────────────────────────────────────────────────────────
+# --- Order book helpers ---
 
 def apply_order_to_book(row, ob, miss_counts, miss_times):
     """Apply one order message to the heap book, track misses."""
@@ -322,9 +316,7 @@ def snapshot_depth_levels(book_qty, best_price, tick_size, n_levels, direction):
     return depths
 
 
-# ─────────────────────────────────────────────────────────────
-# MO aggregation
-# ─────────────────────────────────────────────────────────────
+# --- MO aggregation ---
 
 def aggregate_fills_into_mos(fills, group_gap_us=100, tick_size=0.01):
     """Group consecutive same-side fills within group_gap_us into
@@ -393,7 +385,10 @@ def aggregate_fills_into_mos(fills, group_gap_us=100, tick_size=0.01):
             agg["cls_method"] = first["cls_method"]
 
         opp_L0 = first.get("opp_depth_L0", 0)
-        agg["ratio_L0"] = total_vol / opp_L0 if opp_L0 > 0 else None
+        if opp_L0 > 0:
+            agg["ratio_L0"] = total_vol / opp_L0
+        else:
+            agg["ratio_L0"] = None
 
         aggregated.append(agg)
 
@@ -411,17 +406,10 @@ def merge_bookwalking_mos(mos, tick_size=0.01, ratio_tolerance=0.01):
     if not mos:
         return []
 
-    n_input = len(mos)
     mos_sorted = sorted(mos, key=lambda m: m["first_time_ns"])
-
-    n_ratio1 = sum(
-        1 for m in mos_sorted
-        if m.get("ratio_L0") is not None and abs(m["ratio_L0"] - 1.0) <= ratio_tolerance
-    )
 
     merged = []
     current_group = [mos_sorted[0]]
-    n_merge_events = 0
 
     for mo in mos_sorted[1:]:
         prev = current_group[-1]
@@ -435,21 +423,16 @@ def merge_bookwalking_mos(mos, tick_size=0.01, ratio_tolerance=0.01):
 
         if prev_consumes_L0 and same_side and price_changed:
             current_group.append(mo)
-            n_merge_events += 1
         else:
-            merged.append(_merge_mo_group(current_group, tick_size))
+            merged.append(merge_mo_group(current_group, tick_size))
             current_group = [mo]
 
-    merged.append(_merge_mo_group(current_group, tick_size))
-
-    n_output = len(merged)
-    print(f"    Stage 2 merge: {n_input} -> {n_output} MOs "
-          f"(ratio~1: {n_ratio1}, merge events: {n_merge_events})")
+    merged.append(merge_mo_group(current_group, tick_size))
 
     return merged
 
 
-def _merge_mo_group(group, tick_size):
+def merge_mo_group(group, tick_size):
     """Merge a group of MOs into a single aggregated MO."""
     if len(group) == 1:
         return group[0]
@@ -482,14 +465,15 @@ def _merge_mo_group(group, tick_size):
         merged["cls_method"] = first["cls_method"]
 
     opp_L0 = first.get("opp_depth_L0", 0)
-    merged["ratio_L0"] = total_vol / opp_L0 if opp_L0 > 0 else None
+    if opp_L0 > 0:
+        merged["ratio_L0"] = total_vol / opp_L0
+    else:
+        merged["ratio_L0"] = None
 
     return merged
 
 
-# ─────────────────────────────────────────────────────────────
-# Main extraction function
-# ─────────────────────────────────────────────────────────────
+# --- Main extraction ---
 
 def extract_events_for_day(
     orders_df: pd.DataFrame,
@@ -564,8 +548,10 @@ def extract_events_for_day(
     if market_open is not None and market_close is not None:
         cutoff = day_start.normalize() + pd.to_timedelta(market_open)
 
-    _market_open_ts = day_start.normalize() + pd.to_timedelta(market_open) if market_open else None
-    _market_close_ts = day_start.normalize() + pd.to_timedelta(market_close) if market_close else None
+    if market_close is not None:
+        market_close_ts = day_start.normalize() + pd.to_timedelta(market_close)
+    else:
+        market_close_ts = None
 
     is_bid = orders_df["side"] == 1
     is_ask = orders_df["side"].isin([2, 5])
@@ -621,7 +607,7 @@ def extract_events_for_day(
             if _stable_idx < len(_ts_bbo):
                 first_stable_time = pd.Timestamp(_ts_bbo[_stable_idx])
                 if first_stable_time.tzinfo is None:
-                    first_stable_time = first_stable_time.tz_localize(TZ)
+                    first_stable_time = first_stable_time.tz_localize(warsaw_tz)
 
         if first_stable_time is None:
             first_stable_time = cutoff
@@ -662,9 +648,7 @@ def extract_events_for_day(
     if return_diagnostics:
         diag_rows = []
 
-    # ──────────────────────────────────────────────────────────
-    # Main loop: iterate trades, advance book, classify MOs
-    # ──────────────────────────────────────────────────────────
+    # --- Main loop: iterate trades, advance book, classify MOs ---
     for tr in trades_records:
         t = tr["trade_time"]
         _pre_fill_snap = None
@@ -673,7 +657,7 @@ def extract_events_for_day(
             orow = orders_tuples[order_idx]
 
             if full_extraction and orow.time >= first_stable_time and (
-                _market_close_ts is None or orow.time <= _market_close_ts
+                market_close_ts is None or orow.time <= market_close_ts
             ):
                 _bb, _ba = ob.get_bbo()
                 if _bb is not None and _ba is not None and _ba > _bb:
@@ -702,7 +686,7 @@ def extract_events_for_day(
                         }
 
                     if not _is_fill_d:
-                        _capture_order_event(
+                        capture_order_event(
                             orow, _bb, _ba, ob, tick_size, depth_levels,
                             day_key, lo_cxl_rows,
                             _order_delta0, _n_lo_total, _n_bid_count, _n_ask_count,
@@ -711,7 +695,6 @@ def extract_events_for_day(
 
                     is_lo_event = (
                         orow.action_type == "A"
-                        and hasattr(orow, "order_type_num")
                         and orow.order_type_num == 2
                         and orow.side in (1, 2)
                     )
@@ -756,7 +739,7 @@ def extract_events_for_day(
         trade_price = tr["price_float"]
 
         if return_diagnostics or full_extraction:
-            _snap = {k: side_stats.get(k, 0) for k in _CLS_KEYS}
+            snap = {k: side_stats.get(k, 0) for k in lee_ready_counter_keys}
 
         side = infer_trade_side(
             trade_price=trade_price,
@@ -774,21 +757,28 @@ def extract_events_for_day(
             last_good_quote_ts=last_good_bbo_ts,
         )
 
-        _cls_src = None
+        cls_src = None
         if return_diagnostics or full_extraction:
-            _cls_src = "unclassified"
-            for _k in _CLS_KEYS:
-                if side_stats.get(_k, 0) > _snap[_k]:
-                    _cls_src = _CLS_MAP[_k]
+            cls_src = "unclassified"
+            for counter_key in lee_ready_counter_keys:
+                if side_stats.get(counter_key, 0) > snap[counter_key]:
+                    cls_src = lee_ready_rule_map[counter_key]
                     break
 
         if return_diagnostics:
-            _mid, _sp = np.nan, np.nan
+            diag_mid, diag_spread_ticks = np.nan, np.nan
             if best_bid is not None and best_ask is not None and best_bid < best_ask:
-                _mid = (best_bid + best_ask) / 2.0
-                _sp = round((best_ask - best_bid) / tick_size)
-            _sign = 1.0 if side == "buy" else (-1.0 if side == "sell" else np.nan)
-            diag_rows.append((t, trade_price, best_bid, best_ask, _mid, _sign, _cls_src, _sp))
+                diag_mid = (best_bid + best_ask) / 2.0
+                diag_spread_ticks = round((best_ask - best_bid) / tick_size)
+            if side == "buy":
+                diag_sign = 1.0
+            elif side == "sell":
+                diag_sign = -1.0
+            else:
+                diag_sign = np.nan
+            diag_rows.append((
+                t, trade_price, best_bid, best_ask, diag_mid, diag_sign, cls_src, diag_spread_ticks,
+            ))
 
         if side is None:
             miss_counts["SIDE"] += 1
@@ -803,54 +793,64 @@ def extract_events_for_day(
         # Use pre-fill snapshot (book state before fill-induced deletions)
         # when available; fall back to post-fill state otherwise.
         if full_extraction and side is not None:
-            _fill_bb = _pre_fill_snap['bb'] if _pre_fill_snap else best_bid
-            _fill_ba = _pre_fill_snap['ba'] if _pre_fill_snap else best_ask
+            if _pre_fill_snap is not None:
+                fill_best_bid = _pre_fill_snap['bb']
+                fill_best_ask = _pre_fill_snap['ba']
+            else:
+                fill_best_bid = best_bid
+                fill_best_ask = best_ask
 
-            if _fill_bb is not None and _fill_ba is not None:
+            if fill_best_bid is not None and fill_best_ask is not None:
                 trade_vol = tr.get("volume", 0)
 
                 if _pre_fill_snap is not None:
-                    opp_depths = (_pre_fill_snap['ask_opp'] if side == "buy"
-                                  else _pre_fill_snap['bid_opp'])
+                    if side == "buy":
+                        opp_depths = _pre_fill_snap['ask_opp']
+                    else:
+                        opp_depths = _pre_fill_snap['bid_opp']
                     bid_depths = _pre_fill_snap['bid_depths']
                     ask_depths = _pre_fill_snap['ask_depths']
-                    _bb_sz = _pre_fill_snap['bb_sz']
-                    _ba_sz = _pre_fill_snap['ba_sz']
+                    best_bid_size = _pre_fill_snap['bb_sz']
+                    best_ask_size = _pre_fill_snap['ba_sz']
                 else:
                     if side == "buy":
                         opp_depths = snapshot_depth_levels(
-                            ob.ask_qty, _fill_ba, tick_size,
+                            ob.ask_qty, fill_best_ask, tick_size,
                             mo_depth_levels, +1)
                     else:
                         opp_depths = snapshot_depth_levels(
-                            ob.bid_qty, _fill_bb, tick_size,
+                            ob.bid_qty, fill_best_bid, tick_size,
                             mo_depth_levels, -1)
                     bid_depths = snapshot_depth_levels(
-                        ob.bid_qty, _fill_bb, tick_size, depth_levels, -1)
+                        ob.bid_qty, fill_best_bid, tick_size, depth_levels, -1)
                     ask_depths = snapshot_depth_levels(
-                        ob.ask_qty, _fill_ba, tick_size, depth_levels, +1)
-                    _bb_sz = ob.bid_qty.get(_fill_bb, 0)
-                    _ba_sz = ob.ask_qty.get(_fill_ba, 0)
+                        ob.ask_qty, fill_best_ask, tick_size, depth_levels, +1)
+                    best_bid_size = ob.bid_qty.get(fill_best_bid, 0)
+                    best_ask_size = ob.ask_qty.get(fill_best_ask, 0)
 
-                _tfb = round(abs(trade_price - (_fill_ba if side == "buy"
-                                                else _fill_bb)) / tick_size)
-                _denom = _bb_sz + _ba_sz
-                _microprice = (
-                    (_fill_bb * _ba_sz + _fill_ba * _bb_sz) / _denom
-                    if _denom > 0
-                    else 0.5 * (_fill_bb + _fill_ba)
-                )
+                if side == "buy":
+                    bbo_price = fill_best_ask
+                else:
+                    bbo_price = fill_best_bid
+                ticks_from_bbo = round(abs(trade_price - bbo_price) / tick_size)
+                size_denom = best_bid_size + best_ask_size
+                if size_denom > 0:
+                    microprice = (
+                        fill_best_bid * best_ask_size + fill_best_ask * best_bid_size
+                    ) / size_denom
+                else:
+                    microprice = 0.5 * (fill_best_bid + fill_best_ask)
 
                 fill_dict = {
-                    "time_ns": int(t.value) if hasattr(t, "value") else int(pd.Timestamp(t).value),
+                    "time_ns": int(t.value),
                     "volume": trade_vol,
                     "price": trade_price,
                     "side": side,
-                    "cls_method": _cls_src,
-                    "best_bid": _fill_bb,
-                    "best_ask": _fill_ba,
-                    "ticks_from_bbo": _tfb,
-                    "microprice": _microprice,
+                    "cls_method": cls_src,
+                    "best_bid": fill_best_bid,
+                    "best_ask": fill_best_ask,
+                    "ticks_from_bbo": ticks_from_bbo,
+                    "microprice": microprice,
                 }
                 for i in range(mo_depth_levels):
                     fill_dict[f"opp_depth_L{i}"] = int(opp_depths[i])
@@ -869,16 +869,16 @@ def extract_events_for_day(
         if side is not None:
             last_trade_side = side
 
-    # ── Process remaining orders ──
+    # --- Process remaining orders ---
     while order_idx < len(orders_tuples):
         orow = orders_tuples[order_idx]
 
         if full_extraction and first_stable_time is not None and orow.time >= first_stable_time and (
-            _market_close_ts is None or orow.time <= _market_close_ts
+            market_close_ts is None or orow.time <= market_close_ts
         ):
             _bb, _ba = ob.get_bbo()
             if _bb is not None and _ba is not None and _ba > _bb:
-                _capture_order_event(
+                capture_order_event(
                     orow, _bb, _ba, ob, tick_size, depth_levels,
                     day_key, lo_cxl_rows,
                     _order_delta0, _n_lo_total, _n_bid_count, _n_ask_count,
@@ -886,7 +886,6 @@ def extract_events_for_day(
                 )
                 is_lo_event = (
                     orow.action_type == "A"
-                    and hasattr(orow, "order_type_num")
                     and orow.order_type_num == 2
                     and orow.side in (1, 2)
                 )
@@ -922,16 +921,16 @@ def extract_events_for_day(
                     last_bbo = current_bbo
         order_idx += 1
 
-    # ── Aggregate per-fill timestamps into per-MO timestamps ──
+    # --- Aggregate per-fill timestamps into per-MO timestamps ---
     if _mo_fill_ts:
         _mo_fill_ts.sort(key=lambda x: x[0])
         agg_bid_times = []
         agg_ask_times = []
         prev_ns, prev_side = _mo_fill_ts[0]
         if prev_side == "buy":
-            agg_bid_times.append(pd.Timestamp(prev_ns, tz=TZ))
+            agg_bid_times.append(pd.Timestamp(prev_ns, tz=warsaw_tz))
         else:
-            agg_ask_times.append(pd.Timestamp(prev_ns, tz=TZ))
+            agg_ask_times.append(pd.Timestamp(prev_ns, tz=warsaw_tz))
 
         for ns, s in _mo_fill_ts[1:]:
             dt_us = (ns - prev_ns) / 1000
@@ -939,9 +938,9 @@ def extract_events_for_day(
                 pass
             else:
                 if s == "buy":
-                    agg_bid_times.append(pd.Timestamp(ns, tz=TZ))
+                    agg_bid_times.append(pd.Timestamp(ns, tz=warsaw_tz))
                 else:
-                    agg_ask_times.append(pd.Timestamp(ns, tz=TZ))
+                    agg_ask_times.append(pd.Timestamp(ns, tz=warsaw_tz))
             prev_ns, prev_side = ns, s
 
         n_fills_total = len(mo_bid_times) + len(mo_ask_times)
@@ -994,7 +993,7 @@ def extract_events_for_day(
     return result
 
 
-def _capture_order_event(
+def capture_order_event(
     orow, best_bid, best_ask, ob, tick_size, depth_levels,
     day_key, lo_cxl_rows,
     order_delta0, n_lo_total, n_bid_count, n_ask_count,
@@ -1012,7 +1011,10 @@ def _capture_order_event(
     bb_size = ob.bid_qty.get(best_bid, 0)
     ba_size = ob.ask_qty.get(best_ask, 0)
     total = total_bid + total_ask
-    imbalance = (total_bid - total_ask) / total if total > 0 else 0.0
+    if total > 0:
+        imbalance = (total_bid - total_ask) / total
+    else:
+        imbalance = 0.0
     mid_price = 0.5 * (best_bid + best_ask)
     ticks_from_mid = int(round((orow.price - mid_price) / tick_size))
 
@@ -1023,7 +1025,10 @@ def _capture_order_event(
         else mid_price
     )
 
-    dp_mid = (mid_price - last_mid) if last_mid is not None else None
+    if last_mid is not None:
+        dp_mid = mid_price - last_mid
+    else:
+        dp_mid = None
 
     bid_depths = snapshot_depth_levels(ob.bid_qty, best_bid, tick_size, depth_levels, -1)
     ask_depths = snapshot_depth_levels(ob.ask_qty, best_ask, tick_size, depth_levels, +1)
@@ -1035,7 +1040,6 @@ def _capture_order_event(
 
     is_lo = (
         orow.action_type == "A"
-        and hasattr(orow, "order_type_num")
         and orow.order_type_num == 2
         and orow.side in (1, 2)
     )
@@ -1092,9 +1096,7 @@ def _capture_order_event(
         ))
 
 
-# ─────────────────────────────────────────────────────────────
-# Convenience: run full extraction to SQLite
-# ─────────────────────────────────────────────────────────────
+# --- Run full extraction to SQLite ---
 
 def run_full_extraction(
     asset: str,
@@ -1148,7 +1150,7 @@ def run_full_extraction(
     cur.execute(CREATE_MO_ORDERS_TABLE)
     conn.commit()
 
-    for i, day_key in enumerate(day_keys):
+    for day_key in day_keys:
         orders_df = load_orders_day(orders_h5, day_key)
         trades_df = load_trades_day(trades_h5, day_key, time_field)
 
@@ -1166,7 +1168,7 @@ def run_full_extraction(
         mo_orders = events.pop("_mo_orders", [])
 
         if lo_cxl_rows:
-            cur.executemany(_INSERT_ORDERS_SQL, lo_cxl_rows)
+            cur.executemany(insert_orders_sql, lo_cxl_rows)
 
         if mo_fills:
             fill_tuples = []
@@ -1181,7 +1183,7 @@ def run_full_extraction(
                     *[f.get(f"bid_depth_L{j}", 0) for j in range(5)],
                     *[f.get(f"ask_depth_L{j}", 0) for j in range(5)],
                 ))
-            cur.executemany(_INSERT_FILLS_SQL, fill_tuples)
+            cur.executemany(insert_fills_sql, fill_tuples)
 
         if mo_orders:
             mo_tuples = []
@@ -1198,13 +1200,9 @@ def run_full_extraction(
                     *[o.get(f"bid_depth_L{j}", 0) for j in range(5)],
                     *[o.get(f"ask_depth_L{j}", 0) for j in range(5)],
                 ))
-            cur.executemany(_INSERT_MO_SQL, mo_tuples)
+            cur.executemany(insert_mo_sql, mo_tuples)
 
         conn.commit()
 
-        n_lo = len(lo_cxl_rows)
-        n_mo = len(mo_orders)
-        print(f"  [{i+1}/{len(day_keys)}] {day_key}  LO/CXL={n_lo}  MOs={n_mo}")
-
     conn.close()
-    print(f"\nExtraction complete: {Path(db_path).name}")
+    print(f"Extraction complete: {Path(db_path).name} ({len(day_keys)} days)")

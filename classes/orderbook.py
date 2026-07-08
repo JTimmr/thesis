@@ -52,7 +52,10 @@ class HeapOrderBook:
             return  # ignore duplicate snapshot replay
 
         self.order_map[order_id] = [side, price, volume]
-        book = self.bid_qty if side == 1 else self.ask_qty
+        if side == 1:
+            book = self.bid_qty
+        else:
+            book = self.ask_qty
         book[price] = book.get(price, 0) + volume
 
         if side == 1:
@@ -72,7 +75,10 @@ class HeapOrderBook:
 
         old_side, old_price, old_volume = self.order_map[order_id]
         delta = old_volume - new_volume
-        book = self.bid_qty if old_side == 1 else self.ask_qty
+        if old_side == 1:
+            book = self.bid_qty
+        else:
+            book = self.ask_qty
 
         if old_price in book:
             book[old_price] -= delta
@@ -99,7 +105,10 @@ class HeapOrderBook:
             return False
 
         old_side, old_price, old_volume = self.order_map.pop(order_id)
-        book = self.bid_qty if old_side == 1 else self.ask_qty
+        if old_side == 1:
+            book = self.bid_qty
+        else:
+            book = self.ask_qty
         if old_price in book:
             book[old_price] -= old_volume
             if book[old_price] <= 0:
@@ -149,9 +158,7 @@ class HeapOrderBook:
         return False
 
 
-# ---------------------------------------------------------------------------
-#  BBO series computation
-# ---------------------------------------------------------------------------
+# --- BBO series computation ---
 
 def compute_bbo_series(df: pd.DataFrame):
     """
