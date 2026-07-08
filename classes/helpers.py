@@ -141,13 +141,7 @@ def list_day_keys_from_sqlite(db_path: Union[str, Path]) -> List[str]:
 
 def compute_end_times(timestamps_by_day: Sequence[Sequence[np.ndarray]]) -> np.ndarray:
     """Per-day horizon: max event time (seconds since open) across marks."""
-    return np.array(
-        [
-            max((seq.max() if len(seq) else 0.0) for seq in day_seq)
-            for day_seq in timestamps_by_day
-        ],
-        dtype=np.float64,
-    )
+    return np.array([max((seq.max() if len(seq) else 0.0) for seq in day_seq) for day_seq in timestamps_by_day],dtype=np.float64)
 
 
 def load_events_from_sqlite_bulk(
@@ -283,12 +277,7 @@ def list_day_keys(
         db_file = sqlite_dir / f"{asset_name}_order_flow.sqlite"
         if db_file.exists():
             conn = sqlite3.connect(str(db_file))
-            days = [
-                r[0]
-                for r in conn.execute(
-                    "SELECT DISTINCT day FROM orders ORDER BY day"
-                )
-            ]
+            days = [r[0]for r in conn.execute("SELECT DISTINCT day FROM orders ORDER BY day")]
             conn.close()
             if days:
                 return days
