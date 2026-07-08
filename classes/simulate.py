@@ -1,81 +1,366 @@
 """
-Event-driven limit order book simulation.
+Event-driven limit order book simulation (Numba-accelerated).
 
-Control flags:
-- ``liquidity_guard``: when False, liquidity guard remapping is disabled.
-- ``agents_when_lightweight``: when True, agents receive ``on_event`` in lightweight
-  mode; when False, agents run only in full recording mode (default).
+This is the single simulation engine for the project. Performance features:
+- Numba JIT for Hawkes intensity computation and Ogata thinning
+- BBO caching in the order book (``HeapOrderBookFast``)
+- Price-to-OID index for O(1) market order fills
+- Whole-LO market-order matching (rounds to the nearest resting order boundary)
+- math.log for scalar calls
+
+``SimulateFast`` is kept as a backwards-compatible alias for ``Simulate`` at the
+bottom of this module (the old pure-NumPy fork has been merged into this file).
+
+Four recording modes control the storage/performance trade-off:
+
+- ``'full'``        – all SQLite tables (orders, fills, mo_orders, bbo, intensities).
+- ``'medium'``      – ``bbo`` and ``mo_orders`` only.
+- ``'bbo'``         – ``bbo`` table only (one row per event; no orders/fills/MO).
+- ``'lightweight'`` – no SQLite; compact in-memory buffers only.
+
+For calibration loops, set ``capture_mid=True`` to accumulate the per-event mid
+series in memory (``get_mid_series()``) with no SQLite round-trip, and
+``verbose=False`` to silence per-event progress prints.
 """
 
-import numpy as np
-import pandas as pd
+import os
 import random
 import sqlite3
-import os
-from matplotlib import pyplot as plt
-from .orderbook import HeapOrderBook
+from math import exp, log, tanh
 from pathlib import Path
 from typing import Optional, Union
 
-from .helpers import project_root
+import numba
+import numpy as np
+import pandas as pd
+from matplotlib import pyplot as plt
+
 from ..data.schema import (
-    SIM_CREATE_ORDERS, SIM_CREATE_FILLS, SIM_CREATE_MO_ORDERS,
-    SIM_CREATE_BBO, SIM_CREATE_INTENSITIES,
-    SIM_INSERT_ORDER, SIM_INSERT_FILL, SIM_INSERT_MO,
-    SIM_INSERT_BBO, SIM_INSERT_INTENSITY,
+    SIM_CREATE_BBO,
+    SIM_CREATE_FILLS,
+    SIM_CREATE_INTENSITIES,
+    SIM_CREATE_MO_ORDERS,
+    SIM_CREATE_ORDERS,
+    SIM_INSERT_BBO,
+    SIM_INSERT_FILL,
+    SIM_INSERT_INTENSITY,
+    SIM_INSERT_MO,
+    SIM_INSERT_ORDER,
+    SIM_ORDER_DEPTH_LEVELS,
 )
+from .helpers import project_root
+from .orderbook import HeapOrderBook
+
+
+# --- Numba-accelerated helpers (module level, compiled once) ---
+
+@numba.njit(cache=True)
+def _compute_intensities_jit(baseline, A_stack, adj_stack, decay_stack, dt, n_kernels):
+    """Compute intensity vector via recursive exponential decay (JIT)."""
+    d = baseline.shape[0]
+    intensities = baseline.copy()
+    for k in range(n_kernels):
+        for i in range(d):
+            s = 0.0
+            for j in range(d):
+                decayed = A_stack[k, i, j] * np.exp(-decay_stack[k, i, j] * dt)
+                s += adj_stack[k, i, j] * decay_stack[k, i, j] * decayed
+            intensities[i] += s
+    for i in range(d):
+        if intensities[i] < 0.0:
+            intensities[i] = 0.0
+    return intensities
+
+
+@numba.njit(cache=True)
+def _decay_A_stack(A_stack, decay_stack, dt, n_kernels):
+    """Decay the auxiliary matrix stack in-place."""
+    d = A_stack.shape[1]
+    for k in range(n_kernels):
+        for i in range(d):
+            for j in range(d):
+                A_stack[k, i, j] *= np.exp(-decay_stack[k, i, j] * dt)
+
+
+@numba.njit(cache=True)
+def _record_event_jit(A_stack, decay_stack, t_last, t, dim_idx, n_kernels):
+    """Update auxiliary state after an event (JIT). Returns updated t_last."""
+    dt = t - t_last
+    if dt < 0.0:
+        dt = 0.0
+    d = A_stack.shape[1]
+    for k in range(n_kernels):
+        for i in range(d):
+            for j in range(d):
+                A_stack[k, i, j] *= np.exp(-decay_stack[k, i, j] * dt)
+        for i in range(d):
+            A_stack[k, i, dim_idx] += 1.0
+    return t
+
+
+@numba.njit(cache=True)
+def _sample_next_event_jit(baseline, A_stack, adj_stack, decay_stack, t_last, n_kernels):
+    """Ogata thinning with JIT. Returns (t_event, dim_idx)."""
+    t = t_last
+    d = baseline.shape[0]
+
+    for _ in range(100_000):
+        # Compute intensity upper bound at current t
+        dt = t - t_last
+        if dt < 0.0:
+            dt = 0.0
+        intensities = baseline.copy()
+        for k in range(n_kernels):
+            for i in range(d):
+                s = 0.0
+                for j in range(d):
+                    decayed = A_stack[k, i, j] * np.exp(-decay_stack[k, i, j] * dt)
+                    s += adj_stack[k, i, j] * decay_stack[k, i, j] * decayed
+                intensities[i] += s
+        lambda_star = 0.0
+        for i in range(d):
+            if intensities[i] < 0.0:
+                intensities[i] = 0.0
+            lambda_star += intensities[i]
+
+        if lambda_star < 1e-15:
+            t += 0.1
+            continue
+
+        # Candidate inter-arrival
+        u1 = np.random.random()
+        dt_cand = -np.log(u1) / lambda_star
+        t_cand = t + dt_cand
+
+        # Actual intensity at candidate
+        dt2 = t_cand - t_last
+        if dt2 < 0.0:
+            dt2 = 0.0
+        intensities_cand = baseline.copy()
+        for k in range(n_kernels):
+            for i in range(d):
+                s = 0.0
+                for j in range(d):
+                    decayed = A_stack[k, i, j] * np.exp(-decay_stack[k, i, j] * dt2)
+                    s += adj_stack[k, i, j] * decay_stack[k, i, j] * decayed
+                intensities_cand[i] += s
+        lambda_cand = 0.0
+        for i in range(d):
+            if intensities_cand[i] < 0.0:
+                intensities_cand[i] = 0.0
+            lambda_cand += intensities_cand[i]
+
+        # Accept/reject
+        u2 = np.random.random()
+        if u2 * lambda_star <= lambda_cand:
+            # Categorical sample via cumulative sum
+            u3 = np.random.random() * lambda_cand
+            cumsum = 0.0
+            dim_idx = d - 1
+            for i in range(d):
+                cumsum += intensities_cand[i]
+                if u3 < cumsum:
+                    dim_idx = i
+                    break
+            return t_cand, dim_idx, intensities_cand
+
+        t = t_cand
+
+    # Should not reach here
+    return t, 0, baseline.copy()
+
+
+class HeapOrderBookFast(HeapOrderBook):
+    """HeapOrderBook with BBO caching for reduced overhead."""
+
+    def __init__(self):
+        super().__init__()
+        self._bbo_dirty = True
+        self._cached_bb = None
+        self._cached_ba = None
+
+    def clear(self):
+        super().clear()
+        self._bbo_dirty = True
+        self._cached_bb = None
+        self._cached_ba = None
+
+    def add(self, order_id, side, price, volume):
+        super().add(order_id, side, price, volume)
+        self._bbo_dirty = True
+
+    def modify(self, order_id, new_volume):
+        result = super().modify(order_id, new_volume)
+        self._bbo_dirty = True
+        return result
+
+    def delete(self, order_id):
+        result = super().delete(order_id)
+        self._bbo_dirty = True
+        return result
+
+    def get_bbo(self):
+        if not self._bbo_dirty:
+            return self._cached_bb, self._cached_ba
+        self._clean_heaps()
+        if self.bid_heap and self.ask_heap:
+            self._cached_bb = -self.bid_heap[0]
+            self._cached_ba = self.ask_heap[0]
+        else:
+            self._cached_bb = None
+            self._cached_ba = None
+        self._bbo_dirty = False
+        return self._cached_bb, self._cached_ba
+
 
 class Simulate:
     def __init__(self, arrival_mode, T,
-                 agents=None, kernel_mode="single",
+                 agents=None,
                  db_path=None, flush_every=50_000,
-                 lightweight=False,
+                 lightweight=False, recording_mode=None,
                  guard_soft_ratio=0.25, guard_hard_ratio=0.10,
                  liquidity_guard=True, agents_when_lightweight=False,
-                 tick_size=0.05, alpha_scale=0.9):
-        """Initialize the simulator.
+                 shuffle_agents=False, agents_affect_kernels=True,
+                 agents_affect_mo_sizing=True,
+                 lo_inside_spread_scale=1.0,
+                 lo_p_best=0.10,
+                 lo_inside_c1=0.022021, lo_inside_c0=0.006944,
+                 lo_inside_c1_hi=0.003620, lo_inside_c0_hi=0.163207,
+                 lo_inside_break=9,
+                 tick_size=0.05, alpha_scale=0.9, drift_eps=0.0,
+                 mo_self_scale=1.0, mo_impact_scale=1.0,
+                 resil_kappa=0.0, resil_tau_s=10.0, resil_phi=0.0,
+                 resil_flow_tau_s=40.0, resil_xcap=4.0, resil_pmax=0.85,
+                 verbose=True, capture_mid=False):
+        """Initialise the simulator (Numba-accelerated variant).
 
         Parameters
         ----------
         arrival_mode : str
-            One of 'poisson', 'hawkes_univariate', or 'hawkes_multivariate'.
+            ``'poisson'``, ``'hawkes_univariate'``, or ``'hawkes_multivariate'``.
         T : int
-            Number of events to generate (roughly the trading horizon).
+            Number of events to simulate.
+        recording_mode : {'full', 'medium', 'bbo', 'lightweight'}, optional
+            ``'full'``  – all SQLite tables.
+            ``'medium'`` – ``bbo`` and ``mo_orders`` only.
+            ``'bbo'``    – ``bbo`` only (timestamp, best bid/ask, mid).
+            ``'lightweight'`` – no SQLite; use ``get_compact_results()``.
+            Default ``'full'``.
         lightweight : bool, optional
-            If True, skip ALL heavy recording (SQLite, frames, diagnostics)
-            and only collect compact fills (timestamp, price) and compact
-            MO data (timestamp, side, best_bid, best_ask, ticks_walked).
-            Designed for parallel batch runs where only candlestick and
-            propagator analysis are needed afterwards.
+            Deprecated; ``True`` is equivalent to
+            ``recording_mode='lightweight'``.  Ignored when
+            *recording_mode* is set.
         agents : list, optional
-            List of agent objects that interact with the simulated market.
-            Each agent must implement an ``on_event(sim, t)`` method that
-            is called after every background event.  Agents inspect the
-            order book via ``sim.ob`` and place/cancel orders through the
-            ``agent_place_order``, ``agent_cancel_order``, and
-            ``agent_market_order`` helper methods.  If an agent's
-            ``on_event`` does nothing, the simulation simply continues.
+            Agent objects implementing ``on_event(sim, t, fills)``.
+        drift_eps : float, optional
+            Small directional drift applied to the buy market-order
+            baseline: ``MO_bid`` is scaled by ``1 + drift_eps`` while
+            ``MO_ask`` is left at its calibrated value.  ``drift_eps > 0``
+            injects a mild upward price drift; ``< 0`` a downward one.
+            Default ``0.0`` (no drift — the calibrated, near-driftless
+            kernel).  Only the ``MO_bid`` baseline is touched, so depth,
+            queue dynamics, and the impact propagator are left essentially
+            unchanged.
+        agents_affect_kernels : bool, optional
+            When ``True`` (default), agent actions injected via
+            :meth:`inject_event` excite the Hawkes intensity.  When
+            ``False`` the agents still trade through the book but their
+            order events do not feed the Hawkes excitation state.
+        lo_inside_spread_scale : float, optional
+            Multiplicative scale on the probability that a sampled
+            background limit order is placed inside the spread.  Default
+            ``1.0`` reproduces calibrated behaviour; ``0.0`` disables
+            in-spread placement entirely.
+        lo_p_best : float, optional
+            Baseline probability that a background limit order joins the
+            own-side best quote.  Empirical KGHM value (flat in spread
+            over the well-populated range ``S <= 5``): ``0.10``.
+        lo_inside_c1, lo_inside_c0, lo_inside_c1_hi, lo_inside_c0_hi,
+        lo_inside_break : optional
+            Piecewise-linear baseline inside-spread placement probability
 
-            Agent protocol::
+            ``P(inside | S) = 0``                     for ``S < 2``
+            ``P(inside | S) = c1 * S + c0``           for ``2 <= S <= break``
+            ``P(inside | S) = c1_hi * S + c0_hi``     for ``S > break``
 
-                class MyAgent:
-                    def on_event(self, sim, t, fills):
-                        # sim.ob  = current order book
-                        # t       = simulation time
-                        # fills   = [(oid, price, qty, side), ...]
-                        #           fills on agent orders this cycle
-                        pass
+            (clamped to ``[0, 0.5]``).  Defaults are the corrected
+            empirical KGHM piecewise fit from
+            ``AnalyseMarket.piecewise_inside_fit`` (regime 1 on
+            ``2 <= S <= 9``, regime 2 on ``9 < S <= 20``).  The previous
+            hard-coded single line (``0.03318 * S + 0.01994``) was fitted
+            with an inverted ``ticks_from_best`` sign convention, which
+            misclassified shallow *deep* orders as inside-spread
+            placements.
+        resil_kappa : float, optional
+            Strength of the order-book *resiliency* (stimulated-refill)
+            mechanism.  The mid is tracked against a band-pass anchor built
+            from two EMAs (time constants ``resil_tau_s`` and
+            ``2 * resil_tau_s``): ``dev = mid - 2*EMA_tau + EMA_2tau``.
+            ``dev`` responds fully to a sudden displacement and decays
+            within ~``1.4 * resil_tau_s``, but is exactly zero for a
+            steadily trending mid, so persistent (momentum) moves are not
+            dragged.  When             ``dev`` is ``x`` ticks, background limit orders
+            on the side that would revert the displacement have their
+            at-best / inside-spread placement probabilities multiplied by
+            ``1 + tanh(resil_kappa * x)`` (momentum side by
+            ``1 - tanh(resil_kappa * x)``), a rate-preserving reshuffle of
+            aggressive placement across the two sides.  This is the
+            microscopic analogue
+            of transient price impact decaying: liquidity providers
+            re-quote inside the widened spread after a sudden price move,
+            which produces short-horizon mean reversion in the mid
+            (signature plot dip) while leaving long-horizon dynamics
+            intact.  Default ``0.0`` disables the mechanism entirely
+            (calibrated legacy behaviour).
+        resil_tau_s : float, optional
+            Fast EMA time constant (seconds) of the resiliency anchor: sets
+            the horizon at which reversion pressure acts (dip trough near
+            ``~tau``).  Default ``10.0``.
+        resil_phi : float, optional
+            Strength of the complementary *trend-chasing* placement bias.
+            A smoothed trend signal ``s = EMA_tau - EMA_tau_flow`` (zero at
+            the instant of a price jump, builds only when a move persists,
+            steady-state ``v * (tau_flow - tau)`` along a trend of speed
+            ``v``) shifts the momentum side's at-best/inside placement
+            probabilities up by the same rate-preserving
+            ``1 +/- tanh(resil_phi * s)`` reshuffle.  This propagates
+            persistent moves
+            (liquidity providers re-quote in the direction of the
+            prevailing flow), producing the medium-horizon variance-ratio
+            rise above 1 seen empirically, without touching the
+            short-horizon dip created by ``resil_kappa``.  Default ``0.0``
+            (off).
+        resil_flow_tau_s : float, optional
+            Slow EMA time constant (seconds) of the trend signal.
+            Default ``40.0``.
+        resil_xcap : float, optional
+            Clip on the tick deviations used in the placement multipliers
+            (guards against runaway multipliers after large moves).
+            Default ``4.0``.
+        resil_pmax : float, optional
+            Upper bound on the boosted ``p_best + p_inside`` placement
+            probability mass.  Default ``0.85``.
         """
         self.arrival_mode = arrival_mode
-        self.kernel_mode = kernel_mode
-        self.lightweight = lightweight
+
+        if recording_mode is not None:
+            if recording_mode not in ('full', 'medium', 'bbo', 'lightweight'):
+                raise ValueError(
+                    f"Unknown recording_mode: {recording_mode!r}. "
+                    "Use 'full', 'medium', 'bbo', or 'lightweight'.")
+            self.recording_mode = recording_mode
+        elif lightweight:
+            self.recording_mode = 'lightweight'
+        else:
+            self.recording_mode = 'full'
         self.tick_size = tick_size
+        self.bbo_in_tick_index = True
+        self.price_native_to_pln = float(tick_size)
         self.alpha_scale = alpha_scale
-        if kernel_mode not in ("single", "triple"):
-            raise ValueError(f"Unknown kernel_mode: {kernel_mode}. Use 'single' or 'triple'.")
+        self.drift_eps = float(drift_eps)
         self.T = T
 
-        # ── Liquidity guard ─────────────────────────────────────────────
+        # --- Liquidity guard ---
         self._guard_soft_ratio = guard_soft_ratio
         self._guard_hard_ratio = guard_hard_ratio
         self._guard_stats = {
@@ -84,72 +369,81 @@ class Simulate:
         }
         self.liquidity_guard = liquidity_guard
         self.agents_when_lightweight = agents_when_lightweight
+        self.shuffle_agents = bool(shuffle_agents)
+        self.agents_affect_kernels = bool(agents_affect_kernels)
+        self.agents_affect_mo_sizing = bool(agents_affect_mo_sizing)
+        self.lo_inside_spread_scale = float(lo_inside_spread_scale)
+        self.lo_p_best = float(lo_p_best)
+        self.lo_inside_c1 = float(lo_inside_c1)
+        self.lo_inside_c0 = float(lo_inside_c0)
+        self.lo_inside_c1_hi = float(lo_inside_c1_hi)
+        self.lo_inside_c0_hi = float(lo_inside_c0_hi)
+        self.lo_inside_break = int(lo_inside_break)
+        self.mo_self_scale = float(mo_self_scale)
+        self.mo_impact_scale = float(mo_impact_scale)
+        # --- Resiliency placement bias ---
+        self.resil_kappa = float(resil_kappa)
+        self.resil_tau_s = float(resil_tau_s)
+        self.resil_phi = float(resil_phi)
+        self.resil_flow_tau_s = float(resil_flow_tau_s)
+        self.resil_xcap = float(resil_xcap)
+        self.resil_pmax = float(resil_pmax)
+        self._resil_ema = None      # fast EMA (tau) of the mid, tick units
+        self._resil_ema2 = None     # slow EMA (2*tau) of the mid, tick units
+        self._resil_ema_flow = None  # trend EMA (flow_tau) of the mid
+        self._resil_t = 0.0         # time of the last EMA update
+        self.verbose = bool(verbose)
+        # When True, run() accumulates the per-event mid series in memory
+        # (no SQLite needed) for calibration loops; see get_mid_series().
+        self.capture_mid = bool(capture_mid)
+        self._mid_t = []
+        self._mid_v = []
 
-        # ── Compact data buffers (lightweight mode) ────────────────────
-        # Always initialised; populated only when self.lightweight is True.
-        self._fills_compact = []   # [(timestamp, price), ...]
-        self._mo_compact = []      # [(timestamp, side_str, best_bid, best_ask, ticks_walked), ...]
-
-        # Empirical
-        # self.P_C_GIVEN_Y = np.array([
-        #             0.012, 0.025, 0.035, 0.052, 0.180,
-        #             0.088, 0.035, 0.028, 0.012, 0.035,
-        #             0.005, 0.008, 0.008, 0.003, 0.025,
-        #             0.002, 0.004, 0.002, 0.001, 0.017,
-        #             0.002, 0.002, 0.002, 0.005
-        #         ])
+        # --- Compact data buffers (lightweight mode) ---
+        self._fills_compact = []
+        self._mo_compact = []
 
         # Bin edges for y ∈ [0, 5]
-        self.P_C_Y_BINS = np.linspace(0, 5, 25)
+        self.cancel_y_bins = np.linspace(0, 5, 25)
 
         # Found by Mike & Farmer
-        self.P_C_GIVEN_Y = 0.012*(1-np.exp(-1*self.P_C_Y_BINS))
-        
+        self.cancel_prob_by_y = 0.012 * (1 - np.exp(-1 * self.cancel_y_bins))
 
-        self.P_C_Y_CENTERS = 0.5 * (self.P_C_Y_BINS[:-1] + self.P_C_Y_BINS[1:])
+        self.cancel_prob_y_min = self.cancel_prob_by_y[0]
+        self.cancel_prob_y_max = self.cancel_prob_by_y[-1]
 
-        # Fallback for y outside [0, 5]: use boundary values
-        self.P_C_Y_MIN = self.P_C_GIVEN_Y[0]   # for y < 0
-        self.P_C_Y_MAX = self.P_C_GIVEN_Y[-1]  # for y > 5
-
-        self.beta_depth = 2.145 # 2.1
+        # Passive-depth power law, refit with the corrected ticks_from_best
+        # convention (depth = ticks behind the own-side best, all tfb >= 1).
+        self.beta_depth = 2.1524
         self.xmin_depth = 1
 
-        # Queue-position cancellation weights (fitted Beta distribution)
-        # From empirical WSE data: orders at the back of the queue
-        # (recently placed, high fractional position) are canceled far
-        # more often than orders at the front.
         self.queue_cancel_alpha = 8.1029
         self.queue_cancel_beta  = 0.6585
 
-        # Queue-size acceptance for passive LO placement (accept-reject)
-        # Empirical queue-ahead distribution is ~uniform up to a threshold,
-        # then decays as a steep power law.  Orders into large queues are
-        # accepted with lower probability to match the empirical pattern.
-        self.QUEUE_UNIFORM_MAX = 3500      # threshold (shares) for uniform regime
-        self.QUEUE_TAIL_ALPHA  = 3.99      # power-law exponent for tail decay
-        self.QUEUE_MAX_RETRIES = 20        # max resamples before accepting anyway
+        self.queue_uniform_max = 3500
+        self.queue_tail_alpha = 3.99
+        self.queue_max_retries = 20
 
-        # Limit Order parameters (from order_prices_calibration_KGHM.ipynb)
-        self.LO_MID_MIN = 2           # minimum size in mid regime
-        self.LO_MID_MAX = 4000        # transition point to tail regime
-        self.LO_MID_SLOPE = -0.41     # slope in log-log (near-uniform)
-        self.LO_TAIL_SLOPE = -2.31    # tail regime slope (steeper decay)
-        self.LO_TAIL_MAX = 200_000    # empirical max (from calibration data)
+        # Limit Order parameters
+        self.lo_mid_min = 2
+        self.lo_mid_max = 4000
+        self.lo_mid_slope = -0.41
+        self.lo_tail_slope = -2.31
+        self.lo_tail_max = 200_000
 
-        # Market Order parameters (from MO calibration)
-        self.MO_MID_MIN = 1           # minimum size in mid regime
-        self.MO_MID_MAX = 200         # transition point to tail regime  
-        self.MO_MID_SLOPE = -0.3      # slope in log-log (adjust from MO calibration)
-        self.MO_TAIL_SLOPE = -2.68    # tail regime slope (adjust from MO calibration)
-        self.MO_TAIL_MAX = 155_000    # empirical max: 154,779 (from calibration data)
+        # Market Order parameters
+        self.mo_mid_min = 1
+        self.mo_mid_max = 200
+        self.mo_mid_slope = -0.3
+        self.mo_tail_slope = -2.68
+        self.mo_tail_max = 155_000
 
-        # Ticks-walked CDFs per depth quartile (from order_prices_calibration)
+        # Ticks-walked CDFs per depth quartile
         _tw_path = Path(__file__).resolve().parent.parent / "data" / "mo_depth_data" / "KGHM_tw_quartiles.npz"
         if _tw_path.exists():
-            _td = np.load(_tw_path)
-            self._tw_depth_bounds = _td["depth_quartile_bounds"]  # shape (3,)
-            self._tw_cdfs = [_td[f"tw_cdf_q{i}"] for i in range(4)]
+            ticks_walked_data = np.load(_tw_path)
+            self._tw_depth_bounds = ticks_walked_data["depth_quartile_bounds"]
+            self._tw_cdfs = [ticks_walked_data[f"tw_cdf_q{i}"] for i in range(4)]
             self._tw_loaded = True
         else:
             print(f"WARNING: {_tw_path.name} not found — falling back to static MO sizes")
@@ -160,7 +454,7 @@ class Simulate:
         self._tw_warmup = 2000
         self._tw_recalib_interval = 500
 
-        # Poisson baseline rates (from KGHM calibration)
+        # Poisson baseline rates
         self.poisson_rates = {
             "MO_bid": 0.071652,
             "MO_ask": 0.066922,
@@ -170,41 +464,24 @@ class Simulate:
             "CXL_ask": 0.651098
         }
 
-
-        # Univariate Hawkes parameters (calibrated to KGHM data)
+        # Univariate Hawkes parameters
         self.univariate_baseline = np.array([
-            0.019840,
-            0.018044,
-            0.164048,
-            0.165068,
-            0.205264,
-            0.204799
+            0.019840, 0.018044, 0.164048, 0.165068, 0.205264, 0.204799
         ])
 
         self.univariate_adjacency = np.diag([
-            0.724101,
-            0.730989,
-            0.750187,
-            0.746101,
-            0.687174,
-            0.685461
+            0.724101, 0.730989, 0.750187, 0.746101, 0.687174, 0.685461
         ])
 
         self.univariate_decays = np.diag([
-            19.977277,
-            19.981433,
-            10.111358,
-            10.046270,
-            19.986916,
-            19.982077
+            19.977277, 19.981433, 10.111358, 10.046270, 19.986916, 19.982077
         ])
 
-        # Multivariate Hawkes parameters (calibrated to KGHM data)
-
+        # Multivariate Hawkes parameters
         self.multivariate_adjacency = np.array([
         [0.428726,0.040907,0.000000,0.017025,0.000000,0.000000],
         [0.057898,0.493649,0.000000,0.013028,0.000000,0.000000],
-        [0.165819,0.000000,0.000000,0.000000,1.101833,0.000000],
+        [0.165819,0.000000,0.000000,0.000000,1.104000,0.000000],
         [0.000000,0.000000,0.000000,0.000000,0.000000,1.110977],
         [0.810592,2.148012,0.203659,0.068113,0.221105,0.149018],
         [2.174030,0.000000,0.000000,0.095280,0.775037,0.000000]
@@ -220,151 +497,77 @@ class Simulate:
         ])
 
         self.multivariate_baseline = np.array([
-        0.01263952,
-        0.01149326,
-        0.00000000,
-        0.00000000,
-        0.09788585,
-        0.00000000
+        0.01263952, 0.01149326, 0.00000000, 0.00000000, 0.09788585, 0.00000000
         ])
-
-        # ── Triple-exponential Hawkes parameters ─────────────────────────
-        # Optimised decay rates for sum-of-three-exponentials kernel
-        # (Optuna 500 trials, multivariate tau-time, KGHM, ρ=0.95)
-        self.BETA_FAST = 99.9990
-        self.BETA_MID  = 3.3090
-        self.BETA_SLOW = 0.0012
-
-        # Multivariate triple-exp — manually-tuned values, FULLY symmetrized
-        # Every α[i][j] averaged with α[mirror(i)][mirror(j)] where
-        # mirror swaps bid↔ask: 0↔1, 2↔3, 4↔5.
-        # Base values are the manually-tuned params (commented out below).
-        self.multivariate_triple_baseline = np.array([
-            0.005766, 0.005766, 0.000000, 0.000000, 0.000000, 0.000000
-        ])
-
-        self.multivariate_triple_adjacency_fast = np.array([
-            [0.068545, 0.012797, 0.000000, 0.002306, 0.013029, 0.000000],
-            [0.012797, 0.068545, 0.002306, 0.000000, 0.000000, 0.013029],
-            [0.012417, 0.000000, 0.000000, 0.000000, 1.231247, 0.045555],
-            [0.000000, 0.012417, 0.000000, 0.000000, 0.045555, 1.231247],
-            [0.052225, 1.627118, 0.043475, 0.054523, 0.004591, 0.318264],
-            [1.627118, 0.052225, 0.054523, 0.043475, 0.318264, 0.004591],
-        ])
-        self.multivariate_triple_adjacency_mid = np.array([
-            [0.344115, 0.000207, 0.000000, 0.000000, 0.000000, 0.000000],
-            [0.000207, 0.344115, 0.000000, 0.000000, 0.000000, 0.000000],
-            [0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000],
-            [0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000],
-            [0.375713, 0.000000, 0.154554, 0.000000, 0.137881, 0.005443],
-            [0.000000, 0.375713, 0.000000, 0.154554, 0.005443, 0.137881],
-        ])
-        self.multivariate_triple_adjacency_slow = np.array([
-            [0.142300, 0.110700, 0.000000, 0.000039, 0.000000, 0.000001],
-            [0.110700, 0.142300, 0.000039, 0.000000, 0.000001, 0.000000],
-            [0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000],
-            [0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000],
-            [0.021933, 0.000000, 0.025680, 0.000000, 0.032611, 0.000000],
-            [0.000000, 0.021933, 0.000000, 0.025680, 0.000000, 0.032611],
-        ])
-
-        # ── Previous manually-tuned triple-exp params (kept for reference) ──
-        # self.multivariate_triple_baseline = np.array([
-        #     0.005480, 0.006052, 0.000000, 0.000000, 0.000000, 0.000000
-        # ])
-        # self.multivariate_triple_adjacency_fast = np.array([
-        #     [0.065926, 0.016842, 0.000000, 0.001814, 0.013351, 0.000000],
-        #     [0.008752, 0.071164, 0.002797, 0.000000, 0.000000, 0.012707],
-        #     [0.024833, 0.000000, 0.000000, 0.000000, 1.267371, 0.000000],
-        #     [0.000000, 0.000000, 0.000000, 0.000000, 0.091109, 1.195123],
-        #     [0.104449, 1.616449, 0.086950, 0.109046, 0.009182, 0.030889],
-        #     [1.637787, 0.000000, 0.000000, 0.000000, 0.605639, 0.000000],
-        # ])
-        # self.multivariate_triple_adjacency_mid = np.array([
-        #     [0.367898, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000],
-        #     [0.000413, 0.320332, 0.000000, 0.000000, 0.000000, 0.000000],
-        #     [0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000],
-        #     [0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000],
-        #     [0.751425, 0.000000, 0.211381, 0.000000, 0.219718, 0.010885],
-        #     [0.000000, 0.000000, 0.000000, 0.097726, 0.000000, 0.056044],
-        # ])
-        # self.multivariate_triple_adjacency_slow = np.array([
-        #     [0.1445, 0.1186, 0.000000, 0.000077, 0.000000, 0.000001],
-        #     [0.1028, 0.1401, 0.000000, 0.000000, 0.000000, 0.000000],
-        #     [0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000],
-        #     [0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000],
-        #     [0.000000, 0.000000, 0.000000, 0.000000, 0.065221, 0.000000],
-        #     [0.000000, 0.043866, 0.000000, 0.051359, 0.000000, 0.000000],
-        # ])
 
         self.labels = ["MO_bid","MO_ask","LO_bid","LO_ask","CXL_bid","CXL_ask"]
 
         # cancellation statistics
         self.cancel_stats = {
-            'bid_attempts': 0,
-            'bid_success': 0,
-            'ask_attempts': 0,
-            'ask_success': 0,
+            'bid_attempts': 0, 'bid_success': 0,
+            'ask_attempts': 0, 'ask_success': 0,
         }
-        # track MO outcomes for diagnostics
         self.mo_stats = {
-            'bid_attempts': 0,
-            'bid_filled': 0,
-            'ask_attempts': 0,
-            'ask_filled': 0,
+            'bid_attempts': 0, 'bid_filled': 0,
+            'ask_attempts': 0, 'ask_filled': 0,
         }
         self.lo_stats = []
-        self.mo_sizes = []           # store market order sizes for plotting
-        self.mo_ticks_walked = []    # store ticks walked per MO for diagnostics
+        self.mo_sizes = []
+        self.mo_ticks_walked = []
 
-        self.ob = HeapOrderBook()
+        self.ob = HeapOrderBookFast()
 
         self.order_id_counter = 0
-        self.lifetimes = []          # list of (duration, outcome) tuples
+        self.lifetimes = []
 
-        # ── Array-based order storage (per side) ──────────────────────
-        _CAP = 50_000
-        self._bid_log_prices = np.empty(_CAP)
-        self._bid_delta0s    = np.empty(_CAP)
-        self._bid_times      = np.empty(_CAP)
-        self._bid_oids       = np.empty(_CAP, dtype=np.int64)
+        # --- Array-based order storage (per side) ---
+        initial_order_capacity = 50_000
+        self._bid_log_prices = np.empty(initial_order_capacity)
+        self._bid_delta0s    = np.empty(initial_order_capacity)
+        self._bid_times      = np.empty(initial_order_capacity)
+        self._bid_oids       = np.empty(initial_order_capacity, dtype=np.int64)
         self._bid_n          = 0
-        self._bid_cap        = _CAP
-        self._bid_oid_idx    = {}   # oid -> array index
+        self._bid_cap        = initial_order_capacity
+        self._bid_oid_idx    = {}
 
-        self._ask_log_prices = np.empty(_CAP)
-        self._ask_delta0s    = np.empty(_CAP)
-        self._ask_times      = np.empty(_CAP)
-        self._ask_oids       = np.empty(_CAP, dtype=np.int64)
+        self._ask_log_prices = np.empty(initial_order_capacity)
+        self._ask_delta0s    = np.empty(initial_order_capacity)
+        self._ask_times      = np.empty(initial_order_capacity)
+        self._ask_oids       = np.empty(initial_order_capacity, dtype=np.int64)
         self._ask_n          = 0
-        self._ask_cap        = _CAP
-        self._ask_oid_idx    = {}   # oid -> array index
+        self._ask_cap        = initial_order_capacity
+        self._ask_oid_idx    = {}
 
-        # Distribution diagnostics (populated during run)
-        self.cancel_y_log = []       # y values at each cancellation
-        self.cancel_f_log = []       # fractional queue position f at each cancel
-        self.cancel_dsame_log = []   # same-side distance (ticks) at each cancel
+        # --- Price-to-OID index for O(1) fills ---
+        # Maps price -> insertion-ordered dict {oid: True} used as an
+        # ordered set.  Insertion order == arrival order, so iterating
+        # yields the FIFO queue (price-time priority) that whole-LO MO
+        # matching and the phantom-fill queue model both assume.
+        self._bid_price_oids = {}  # price -> {oid: True} (FIFO)
+        self._ask_price_oids = {}  # price -> {oid: True} (FIFO)
 
-        # Track last known best prices (in log space) to detect changes
+        # Distribution diagnostics
+        self.cancel_y_log = []
+        self.cancel_f_log = []
+        self.cancel_dsame_log = []
+
         self.last_log_best_ask = None
         self.last_log_best_bid = None
 
-        # ── Agent infrastructure ──
-        self.agents = agents if agents is not None else []
-        self.agent_oids = set()  # order IDs belonging to agents (protected from background CXL)
-        self._agent_fills = []   # filled agent orders this event cycle: [(oid, price, qty, side)]
-        self.last_trade_price = None  # last executed trade price (for candlestick charts)
+        # --- Agent infrastructure ---
+        if agents is None:
+            self.agents = []
+        else:
+            self.agents = agents
+        self.agent_oids = set()
+        self._agent_fills = []
+        self.last_trade_price = None
 
-        # Safe defaults used by process_event before run() sets event-time state.
-        # before run() sets event-time state.
         self.current_time = 0.0
         self.current_index = 0
         self.current_stamp = 0.0
 
-        self.frames = []
-        self.executed_events = []  # record events that actually modify the book
-
-        # ── Event database infrastructure ──────────────────────────────
+        # --- Event database infrastructure ---
         self.db_path = db_path
         self._flush_every = flush_every
         self._db_conn = None
@@ -376,18 +579,10 @@ class Simulate:
         self._intensities_buf = []
         self._prev_event_time = None
         self._prev_mid = None
-        self._event_detail = None   # set by process_event for DB recording
-        self._mo_fill_log = []      # individual MO fills for DB recording
+        self._event_detail = None
+        self._mo_fill_log = []
 
-        # -----------------------------------------------------------------
-        # Unified intensity parameters for on-the-fly event generation.
-        # All three modes (poisson, hawkes_univariate, hawkes_multivariate)
-        # use the same Ogata thinning sampler.
-        #
-        # Internal state uses *lists* of adjacency / decay / auxiliary
-        # matrices so that single-exp (K=1) and double-exp (K=2) kernels
-        # share the same code path.
-        # -----------------------------------------------------------------
+        # --- Unified intensity parameters (stacked 3D arrays for Numba) ---
         d = len(self.labels)
         if self.arrival_mode == "poisson":
             rates = [self.poisson_rates[l] for l in self.labels]
@@ -397,78 +592,164 @@ class Simulate:
             self._decays_list = [np.ones((d, d))]
 
         elif self.arrival_mode == "hawkes_univariate":
-            if self.kernel_mode == "single":
-                self._baseline = self.univariate_baseline.copy()
-                self._n_kernels = 1
-                self._adjacency_list = [self.univariate_adjacency.copy()]
-                self._decays_list = [self.univariate_decays.copy()]
-            else:  # triple
-                raise NotImplementedError(
-                    "Univariate triple-exponential kernel is not yet calibrated. "
-                    "Calibrate the parameters and set univariate_triple_* attributes "
-                    "before using this mode."
-                )
+            self._baseline = self.univariate_baseline.copy()
+            self._n_kernels = 1
+            self._adjacency_list = [self.univariate_adjacency.copy()]
+            self._decays_list = [self.univariate_decays.copy()]
 
         elif self.arrival_mode == "hawkes_multivariate":
-            if self.kernel_mode == "single":
-                self._baseline = self.multivariate_baseline.copy()
-                self._n_kernels = 1
-                self._adjacency_list = [self.multivariate_adjacency.copy()]
-                self._decays_list = [self.multivariate_decays.copy()]
-            else:  # triple
-                self._baseline = self.multivariate_triple_baseline.copy()
-                self._n_kernels = 3
-                self._adjacency_list = [
-                    self.multivariate_triple_adjacency_fast.copy() * self.alpha_scale,
-                    self.multivariate_triple_adjacency_mid.copy() * self.alpha_scale,
-                    self.multivariate_triple_adjacency_slow.copy() * self.alpha_scale,
-                ]
-                self._decays_list = [
-                    np.full((d, d), self.BETA_FAST),
-                    np.full((d, d), self.BETA_MID),
-                    np.full((d, d), self.BETA_SLOW),
-                ]
+            self._baseline = self.multivariate_baseline.copy()
+            self._n_kernels = 1
+            self._adjacency_list = [self.multivariate_adjacency.copy()]
+            self._decays_list = [self.multivariate_decays.copy()]
         else:
             raise ValueError(f"Unknown arrival_mode: {self.arrival_mode}")
 
-        # Auxiliary matrices for intensity computation (one per kernel)
-        # Updated recursively: no event history stored
-        self._A_list = [np.zeros((d, d)) for _ in range(self._n_kernels)]
-        self._t_last = 0.0  # time of last Hawkes state update
+        # Symmetric MO self-excitation tuning (single-kernel multivariate only).
+        # Default 1.0 leaves calibrated matrices unchanged.
+        if self.mo_self_scale != 1.0:
+            if self.arrival_mode == "hawkes_multivariate":
+                mo_bid = self.labels.index("MO_bid")
+                mo_ask = self.labels.index("MO_ask")
+                adj = self._adjacency_list[0]
+                s = self.mo_self_scale
+                adj[mo_bid, mo_bid] *= s
+                adj[mo_ask, mo_ask] *= s
+            else:
+                raise ValueError(
+                    "mo_self_scale applies only to hawkes_multivariate"
+                )
 
+        # --- Optional directional drift on the buy market-order baseline ---
+        # MO_bid (idx 0) is the buy-trade arrival that walks the ask up, so
+        # scaling only its baseline injects a mild upward price drift while
+        # leaving MO_ask and all LO/CXL (depth, queue, impact) untouched.
+        if self.drift_eps != 0.0:
+            mo_bid = self.labels.index("MO_bid")
+            self._baseline[mo_bid] *= (1.0 + self.drift_eps)
+            if self.verbose:
+                print(f"drift_eps={self.drift_eps:+.3f}: MO_bid baseline "
+                      f"x{1.0 + self.drift_eps:.3f} (MO_ask unchanged)")
+
+        # Stack into contiguous 3D arrays for Numba
+        self._adj_stack = np.stack(self._adjacency_list)
+        self._decay_stack = np.stack(self._decays_list)
+        self._A_stack = np.zeros((self._n_kernels, d, d))
+        self._t_last = 0.0
+
+    def load_single_hawkes_params(self, baseline, adjacency, decays):
+        """Inject explicit single-kernel (K=1) Hawkes params.
+
+        Used by the mean-reversion calibration search to swap in a perturbed
+        cross-excitation matrix. ``baseline`` is ``(d,)``, ``adjacency`` and
+        ``decays`` are ``(d, d)``. ``drift_eps`` is re-applied to the
+        ``MO_bid`` baseline exactly as in ``__init__``, so pass the *unscaled*
+        calibrated baseline. The Numba stacks are rebuilt so ``run()`` sees
+        the new params.
+        """
+        d = len(self.labels)
+        bl = np.asarray(baseline, dtype=float).ravel()
+        adj = np.asarray(adjacency, dtype=float)
+        dec = np.asarray(decays, dtype=float)
+        if bl.size != d:
+            raise ValueError(f"Expected baseline length {d}, got {bl.shape}")
+        if adj.shape != (d, d):
+            raise ValueError(f"Expected adjacency shape {(d, d)}, got {adj.shape}")
+        if dec.shape != (d, d):
+            raise ValueError(f"Expected decays shape {(d, d)}, got {dec.shape}")
+        self._baseline = bl.copy()
+        self._n_kernels = 1
+        self._adjacency_list = [adj.astype(float, copy=True)]
+        self._decays_list = [dec.astype(float, copy=True)]
+        if self.drift_eps != 0.0:
+            mo_bid = self.labels.index("MO_bid")
+            self._baseline[mo_bid] *= (1.0 + self.drift_eps)
+        self._adj_stack = np.stack(self._adjacency_list)
+        self._decay_stack = np.stack(self._decays_list)
+        self._A_stack = np.zeros((self._n_kernels, d, d))
+
+    def load_multi_mo_hawkes_params(self, baseline, adjacency, decays,
+                                     cross_alphas, self_alphas, betas):
+        """Inject a K=(1+N) hybrid kernel: base + N extra MO timescales.
+
+        Kernel 0 is the full calibrated single kernel (all d x d pairs).
+        Kernels 1..N each add symmetric MO cross- and self-excitation at a
+        specific decay rate (timescale), used to reproduce the multi-timescale
+        mean-reversion signature.
+
+        Parameters
+        ----------
+        baseline : array (d,)
+            Unscaled baseline intensities (drift_eps is re-applied internally).
+        adjacency : array (d, d)
+            Base single-kernel adjacency (branching) matrix.
+        decays : array (d, d)
+            Base single-kernel decay matrix.
+        cross_alphas : list of N floats
+            MO cross-excitation adjacency per additional timescale.
+            Applied symmetrically: MO_bid<->MO_ask.
+        self_alphas : list of N floats
+            MO self-excitation adjacency per additional timescale.
+            Applied symmetrically: MO_bid->MO_bid and MO_ask->MO_ask.
+        betas : list of N floats
+            Decay rate for each additional timescale component.
+        """
+        d = len(self.labels)
+        bl = np.asarray(baseline, dtype=float).ravel().copy()
+        adj0 = np.array(adjacency, dtype=float, copy=True)
+        dec0 = np.array(decays, dtype=float, copy=True)
+        if bl.size != d:
+            raise ValueError(f"Expected baseline length {d}, got {bl.shape}")
+        if adj0.shape != (d, d):
+            raise ValueError(f"Expected adjacency shape {(d, d)}, got {adj0.shape}")
+
+        adj_list = [adj0]
+        dec_list = [dec0]
+        mo_bid, mo_ask = 0, 1
+
+        for alpha_c, alpha_s, beta in zip(cross_alphas, self_alphas, betas):
+            adj_k = np.zeros((d, d))
+            dec_k = np.ones((d, d))
+            adj_k[mo_ask, mo_bid] = alpha_c
+            adj_k[mo_bid, mo_ask] = alpha_c
+            adj_k[mo_bid, mo_bid] = alpha_s
+            adj_k[mo_ask, mo_ask] = alpha_s
+            dec_k[mo_ask, mo_bid] = beta
+            dec_k[mo_bid, mo_ask] = beta
+            dec_k[mo_bid, mo_bid] = beta
+            dec_k[mo_ask, mo_ask] = beta
+            adj_list.append(adj_k)
+            dec_list.append(dec_k)
+
+        self._baseline = bl
+        self._n_kernels = len(adj_list)
+        self._adjacency_list = adj_list
+        self._decays_list = dec_list
+        if self.drift_eps != 0.0:
+            mo_bid_idx = self.labels.index("MO_bid")
+            self._baseline[mo_bid_idx] *= (1.0 + self.drift_eps)
+        self._adj_stack = np.stack(self._adjacency_list)
+        self._decay_stack = np.stack(self._decays_list)
+        self._A_stack = np.zeros((self._n_kernels, d, d))
+        self._A_seeded = None
+
+    @property
+    def lightweight(self):
+        """True iff ``recording_mode == 'lightweight'``."""
+        return self.recording_mode == 'lightweight'
 
     def _compute_intensities(self, t):
-        """Compute intensity vector λ(t) via recursive exponential decay.
-
-        For K kernel components:
-            λ_i(t) = μ_i + Σ_k Σ_j α^(k)_ij · β^(k)_ij · A^(k)_ij(t)
-        where  A^(k)_ij(t) = A^(k)_ij(t_last) · exp(-β^(k)_ij · Δt)
-
-        Returns
-        -------
-        intensities : ndarray (d,)
-        None        : (kept for API compatibility)
-        """
+        """Compute intensity vector λ(t) via Numba JIT."""
         dt = max(t - self._t_last, 0.0)
-        intensities = self._baseline.copy()
-        for k in range(self._n_kernels):
-            A_k_decayed = self._A_list[k] * np.exp(-self._decays_list[k] * dt)
-            intensities += np.sum(
-                self._adjacency_list[k] * self._decays_list[k] * A_k_decayed,
-                axis=1,
-            )
-        np.maximum(intensities, 0.0, out=intensities)  # float safety
+        intensities = _compute_intensities_jit(
+            self._baseline, self._A_stack, self._adj_stack,
+            self._decay_stack, dt, self._n_kernels
+        )
         return intensities, None
 
-
-    # ── Liquidity guard helpers ─────────────────────────────────────
+    # --- Liquidity guard helpers ---
 
     def _liquidity_state(self):
-        """Compute current liquidity metrics for the guard.
-
-        Returns ``(thin_side, depth_ratio)`` or ``None`` when the book
-        is one-sided.
-        """
         bid_depth = self.ob.total_bid_depth
         ask_depth = self.ob.total_ask_depth
 
@@ -477,22 +758,14 @@ class Simulate:
 
         max_depth = max(bid_depth, ask_depth)
         depth_ratio = min(bid_depth, ask_depth) / max_depth
-        thin_side = 'bid' if bid_depth < ask_depth else 'ask'
+        if bid_depth < ask_depth:
+            thin_side = 'bid'
+        else:
+            thin_side = 'ask'
 
         return (thin_side, depth_ratio)
 
     def _guard_event(self, label):
-        """Apply liquidity guard to a sampled background event label.
-
-        Returns the (possibly remapped) label.  Dangerous events that would
-        further deplete the thin side of the book are remapped to a
-        replenishing limit order on that side.
-
-        Two regimes:
-          * **Hard** (``depth_ratio < hard_ratio``): always remap.
-          * **Soft** (``depth_ratio < soft_ratio``): remap with probability
-            that increases linearly as the ratio drops toward the hard floor.
-        """
         state = self._liquidity_state()
         if state is None:
             return label
@@ -511,7 +784,6 @@ class Simulate:
         if label not in (dangerous_mo, dangerous_cxl):
             return label
 
-        # Hard regime: deterministic remap
         if depth_ratio < self._guard_hard_ratio:
             if label == dangerous_mo:
                 self._guard_stats['hard_mo_blocked'] += 1
@@ -519,11 +791,12 @@ class Simulate:
                 self._guard_stats['hard_cxl_blocked'] += 1
             return safe_lo
 
-        # Soft regime: probabilistic remap (linear ramp from 0 at soft_ratio
-        # to 1 at hard_ratio)
         if depth_ratio < self._guard_soft_ratio:
             span = self._guard_soft_ratio - self._guard_hard_ratio
-            p_remap = (self._guard_soft_ratio - depth_ratio) / span if span > 0 else 1.0
+            if span > 0:
+                p_remap = (self._guard_soft_ratio - depth_ratio) / span
+            else:
+                p_remap = 1.0
             if random.random() < p_remap:
                 if label == dangerous_mo:
                     self._guard_stats['soft_mo_remapped'] += 1
@@ -534,7 +807,6 @@ class Simulate:
         return label
 
     def _open_db(self, overwrite=False):
-        """Create / open the SQLite database and set up tables."""
         if self.db_path is None:
             return
         if os.path.exists(self.db_path) and not overwrite:
@@ -544,61 +816,63 @@ class Simulate:
                 f"  To overwrite:             sim.run(overwrite=True)"
             )
         if os.path.exists(self.db_path) and overwrite:
-            os.remove(self.db_path)
+            Path(self.db_path).unlink(missing_ok=True)
             print(f"Overwriting existing database: {Path(self.db_path).name}")
         self._db_conn = sqlite3.connect(self.db_path)
         self._db_cursor = self._db_conn.cursor()
         self._db_cursor.execute("PRAGMA journal_mode=WAL")
         self._db_cursor.execute("PRAGMA synchronous=NORMAL")
-        self._db_cursor.execute(SIM_CREATE_ORDERS)
-        self._db_cursor.execute(SIM_CREATE_FILLS)
-        self._db_cursor.execute(SIM_CREATE_MO_ORDERS)
+        if self.recording_mode == 'full':
+            self._db_cursor.execute(SIM_CREATE_ORDERS)
+            self._db_cursor.execute(SIM_CREATE_FILLS)
+            self._db_cursor.execute(SIM_CREATE_INTENSITIES)
+        if self.recording_mode != 'bbo':
+            self._db_cursor.execute(SIM_CREATE_MO_ORDERS)
         self._db_cursor.execute(SIM_CREATE_BBO)
-        self._db_cursor.execute(SIM_CREATE_INTENSITIES)
         self._db_conn.commit()
 
     def _flush_db(self):
-        """Write accumulated buffers to SQLite and clear them."""
         if self._db_conn is None:
             return
-        if self._orders_buf:
-            self._db_cursor.executemany(SIM_INSERT_ORDER, self._orders_buf)
-            self._orders_buf.clear()
-        if self._fills_buf:
-            self._db_cursor.executemany(SIM_INSERT_FILL, self._fills_buf)
-            self._fills_buf.clear()
-        if self._mo_buf:
+        if self.recording_mode == 'full':
+            if self._orders_buf:
+                self._db_cursor.executemany(SIM_INSERT_ORDER, self._orders_buf)
+                self._orders_buf.clear()
+            if self._fills_buf:
+                self._db_cursor.executemany(SIM_INSERT_FILL, self._fills_buf)
+                self._fills_buf.clear()
+            if self._intensities_buf:
+                self._db_cursor.executemany(SIM_INSERT_INTENSITY, self._intensities_buf)
+                self._intensities_buf.clear()
+        if self.recording_mode != 'bbo' and self._mo_buf:
             self._db_cursor.executemany(SIM_INSERT_MO, self._mo_buf)
             self._mo_buf.clear()
         if self._bbo_buf:
             self._db_cursor.executemany(SIM_INSERT_BBO, self._bbo_buf)
             self._bbo_buf.clear()
-        if self._intensities_buf:
-            self._db_cursor.executemany(SIM_INSERT_INTENSITY, self._intensities_buf)
-            self._intensities_buf.clear()
         self._db_conn.commit()
 
     def _close_db(self):
-        """Final flush, create indices, and close the database."""
         self._flush_db()
         if self._db_conn:
-            self._db_cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_orders_ts ON orders(timestamp)")
-            self._db_cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills(timestamp)")
-            self._db_cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_mo_ts ON mo_orders(timestamp)")
+            if self.recording_mode == 'full':
+                self._db_cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_orders_ts ON orders(timestamp)")
+                self._db_cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills(timestamp)")
+                self._db_cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_int_ts ON intensities(timestamp)")
+            if self.recording_mode != 'bbo':
+                self._db_cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_mo_ts ON mo_orders(timestamp)")
             self._db_cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_bbo_ts ON bbo(timestamp)")
-            self._db_cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_int_ts ON intensities(timestamp)")
             self._db_conn.commit()
             self._db_conn.close()
             self._db_conn = None
             self._db_cursor = None
 
     def _snapshot_pre_event(self, bb, ba):
-        """Snapshot book state *before* an event modifies it."""
         if bb is None or ba is None:
             return None
         mid = (bb + ba) / 2.0
@@ -621,10 +895,15 @@ class Simulate:
             'ask_depths': [self.ob.ask_qty.get(ba + i, 0) for i in range(5)],
             'opp_ask_10': [self.ob.ask_qty.get(ba + i, 0) for i in range(10)],
             'opp_bid_10': [self.ob.bid_qty.get(bb - i, 0) for i in range(10)],
+            # Wide same-side depth for the orders table (phantom queue_ahead);
+            # MO/fills rows keep the 5-level arrays above.
+            'bid_depths_ord': [self.ob.bid_qty.get(bb - i, 0)
+                               for i in range(SIM_ORDER_DEPTH_LEVELS)],
+            'ask_depths_ord': [self.ob.ask_qty.get(ba + i, 0)
+                               for i in range(SIM_ORDER_DEPTH_LEVELS)],
         }
 
     def _record_to_db(self, t, label, pre, counter):
-        """Build DB rows from pre-event state + event detail, append to buffers."""
         if pre is None:
             return
 
@@ -636,7 +915,6 @@ class Simulate:
         dp_mid = ((mid - self._prev_mid)
                    if self._prev_mid is not None else 0.0)
 
-        # Always record BBO (in PLN)
         self._bbo_buf.append((t, bb * ts, ba * ts, mid * ts))
 
         detail = self._event_detail
@@ -648,28 +926,35 @@ class Simulate:
         etype = detail.get('type')
 
         if etype in ('LO', 'CXL'):
-            side = detail['side']
-            price = detail['price']
-            best_same = bb if side == 1 else ba
-            ticks_from_mid = int(round(price - mid))
-            is_cancel = 1 if etype == 'CXL' else 0
+            if self.recording_mode == 'full':
+                side = detail['side']
+                price = detail['price']
+                if side == 1:
+                    best_same = bb
+                else:
+                    best_same = ba
+                ticks_from_mid = int(round(price - mid))
+                if etype == 'CXL':
+                    is_cancel = 1
+                else:
+                    is_cancel = 0
 
-            row = (
-                t, etype, detail['oid'], side, price * ts,
-                bb * ts, ba * ts, best_same * ts, pre['bb_size'], pre['ba_size'],
-                pre['total_bid'], pre['total_ask'], mid * ts,
-                ticks_from_mid, spread * ts, int(spread), pre['imbalance'],
-                detail.get('ticks_from_best', 0),
-                detail.get('queue_ahead', 0),
-                detail.get('volume', 0),
-                detail.get('delta0', 0.0),
-                detail.get('delta_t', detail.get('delta0', 0.0)),
-                detail.get('y_ratio', 1.0),
-                dt_prev, pre['n_total'], is_cancel, pre['microprice'] * ts,
-                pre['n_bid'], pre['n_ask'], dp_mid * ts,
-                *pre['bid_depths'], *pre['ask_depths'],
-            )
-            self._orders_buf.append(row)
+                row = (
+                    t, etype, detail['oid'], side, price * ts,
+                    bb * ts, ba * ts, best_same * ts, pre['bb_size'], pre['ba_size'],
+                    pre['total_bid'], pre['total_ask'], mid * ts,
+                    ticks_from_mid, spread * ts, int(spread), pre['imbalance'],
+                    detail.get('ticks_from_best', 0),
+                    detail.get('queue_ahead', 0),
+                    detail.get('volume', 0),
+                    detail.get('delta0', 0.0),
+                    detail.get('delta_t', detail.get('delta0', 0.0)),
+                    detail.get('y_ratio', 1.0),
+                    dt_prev, pre['n_total'], is_cancel, pre['microprice'] * ts,
+                    pre['n_bid'], pre['n_ask'], dp_mid * ts,
+                    *pre['bid_depths_ord'], *pre['ask_depths_ord'],
+                )
+                self._orders_buf.append(row)
 
         elif etype == 'MO':
             side_text = detail['side_text']
@@ -688,7 +973,10 @@ class Simulate:
             ratio_L0 = (mo_vol / L0_depth if L0_depth > 0
                         else float('inf'))
 
-            fill_prices = [p * ts for p, _ in fills] if fills else [0]
+            if fills:
+                fill_prices = [p * ts for p, _ in fills]
+            else:
+                fill_prices = [0]
             mo_row = (
                 t, side_text, mo_vol, len(fills),
                 min(fill_prices), max(fill_prices),
@@ -697,17 +985,18 @@ class Simulate:
             )
             self._mo_buf.append(mo_row)
 
-            for fill_price, fill_vol in fills:
-                if side_int == 1:
-                    ticks_from_bbo = int(fill_price - ba)
-                else:
-                    ticks_from_bbo = int(bb - fill_price)
-                fill_row = (
-                    t, fill_vol, fill_price * ts, side_text,
-                    bb * ts, ba * ts, ticks_from_bbo, pre['microprice'] * ts,
-                    *opp_10, *pre['bid_depths'], *pre['ask_depths'],
-                )
-                self._fills_buf.append(fill_row)
+            if self.recording_mode == 'full':
+                for fill_price, fill_vol in fills:
+                    if side_int == 1:
+                        ticks_from_bbo = int(fill_price - ba)
+                    else:
+                        ticks_from_bbo = int(bb - fill_price)
+                    fill_row = (
+                        t, fill_vol, fill_price * ts, side_text,
+                        bb * ts, ba * ts, ticks_from_bbo, pre['microprice'] * ts,
+                        *opp_10, *pre['bid_depths'], *pre['ask_depths'],
+                    )
+                    self._fills_buf.append(fill_row)
 
         self._prev_event_time = t
         self._prev_mid = mid
@@ -717,67 +1006,29 @@ class Simulate:
 
     def _record_event(self, t, dim_idx):
         """Update auxiliary state after an event of type *dim_idx* at time *t*."""
-        dt = max(t - self._t_last, 0.0)
-        for k in range(self._n_kernels):
-            self._A_list[k] *= np.exp(-self._decays_list[k] * dt)
-            self._A_list[k][:, dim_idx] += 1.0
-        self._t_last = t
+        self._t_last = _record_event_jit(
+            self._A_stack, self._decay_stack, self._t_last, t, dim_idx, self._n_kernels
+        )
 
     def _sample_next_event(self):
-        """Sample the next event using Ogata's thinning algorithm.
-
-        Returns
-        -------
-        (t, label, intensities) : tuple
-            Event time, type label, and intensity vector at event time.
-        """
-        t = self._t_last
-
-        for _ in range(100_000):
-            # Intensity upper bound (intensity only decays between events)
-            intensities, _ = self._compute_intensities(t)
-            lambda_star = intensities.sum()
-
-            if lambda_star < 1e-15:
-                t += 0.1
-                continue
-
-            # Candidate inter-arrival time
-            dt = np.random.exponential(1.0 / lambda_star)
-            t_cand = t + dt
-
-            # Actual intensity at candidate time (decayed)
-            intensities_cand, _ = self._compute_intensities(t_cand)
-            lambda_cand = intensities_cand.sum()
-
-            # Accept / reject
-            if random.random() * lambda_star <= lambda_cand:
-                probs = intensities_cand / lambda_cand
-                dim_idx = np.random.choice(len(self.labels), p=probs)
-                self._record_event(t_cand, dim_idx)
-                return t_cand, self.labels[dim_idx], intensities_cand
-
-            # Rejected — advance time (tighter upper bound next iteration)
-            t = t_cand
-
-        raise RuntimeError(
-            "Ogata thinning failed to produce an event after 100 000 iterations"
+        """Sample the next event using Ogata's thinning (Numba JIT)."""
+        t_cand, dim_idx, intensities_cand = _sample_next_event_jit(
+            self._baseline, self._A_stack, self._adj_stack,
+            self._decay_stack, self._t_last, self._n_kernels
         )
+        # Update auxiliary state
+        self._t_last = _record_event_jit(
+            self._A_stack, self._decay_stack, self._t_last, t_cand, dim_idx, self._n_kernels
+        )
+        return t_cand, self.labels[dim_idx], intensities_cand
 
     def inject_event(self, t, label):
         """Inject an external event into the Hawkes excitation state.
 
-        Call this from a trading bot so that its action excites future
-        event intensities.  The caller is responsible for any order-book
-        modifications — this method only updates the intensity state.
-
-        Parameters
-        ----------
-        t : float
-            Event time (must be ≥ current simulation time).
-        label : str
-            Event type (one of self.labels).
+        When ``self.agents_affect_kernels`` is ``False`` this is a no-op.
         """
+        if not self.agents_affect_kernels:
+            return
         dim_idx = self.labels.index(label)
         self._record_event(t, dim_idx)
 
@@ -802,6 +1053,15 @@ class Simulate:
             self._bid_oids[n]       = oid
             self._bid_oid_idx[oid]  = n
             self._bid_n = n + 1
+            # Price-to-OID index
+            if oid in self.ob.order_map:
+                price = self.ob.order_map[oid][1]
+            else:
+                price = None
+            if price is not None:
+                if price not in self._bid_price_oids:
+                    self._bid_price_oids[price] = {}
+                self._bid_price_oids[price][oid] = True
         else:
             n = self._ask_n
             if n >= self._ask_cap:
@@ -817,6 +1077,15 @@ class Simulate:
             self._ask_oids[n]       = oid
             self._ask_oid_idx[oid]  = n
             self._ask_n = n + 1
+            # Price-to-OID index
+            if oid in self.ob.order_map:
+                price = self.ob.order_map[oid][1]
+            else:
+                price = None
+            if price is not None:
+                if price not in self._ask_price_oids:
+                    self._ask_price_oids[price] = {}
+                self._ask_price_oids[price][oid] = True
 
     def _remove_order(self, side, oid):
         """Remove an order via swap-and-pop. O(1). Returns placement time."""
@@ -826,6 +1095,22 @@ class Simulate:
                 return None
             i = idx_map.pop(oid)
             t_placed = float(self._bid_times[i])
+            # Remove from price-to-oid index
+            if oid in self.ob.order_map:
+                price = self.ob.order_map[oid][1]
+                s = self._bid_price_oids.get(price)
+                if s:
+                    s.pop(oid, None)
+                    if not s:
+                        del self._bid_price_oids[price]
+            else:
+                # Order already removed from book; scan price index
+                for price, s in list(self._bid_price_oids.items()):
+                    if oid in s:
+                        s.pop(oid, None)
+                        if not s:
+                            del self._bid_price_oids[price]
+                        break
             self._bid_n -= 1
             last = self._bid_n
             if i < last:
@@ -842,6 +1127,21 @@ class Simulate:
                 return None
             i = idx_map.pop(oid)
             t_placed = float(self._ask_times[i])
+            # Remove from price-to-oid index
+            if oid in self.ob.order_map:
+                price = self.ob.order_map[oid][1]
+                s = self._ask_price_oids.get(price)
+                if s:
+                    s.pop(oid, None)
+                    if not s:
+                        del self._ask_price_oids[price]
+            else:
+                for price, s in list(self._ask_price_oids.items()):
+                    if oid in s:
+                        s.pop(oid, None)
+                        if not s:
+                            del self._ask_price_oids[price]
+                        break
             self._ask_n -= 1
             last = self._ask_n
             if i < last:
@@ -854,8 +1154,10 @@ class Simulate:
             return t_placed
 
     def _get_order_data(self, side, oid):
-        """Return (log_price, delta0_log) for an order, or (0.0, 1.0) if missing."""
-        idx_map = self._bid_oid_idx if side == 1 else self._ask_oid_idx
+        if side == 1:
+            idx_map = self._bid_oid_idx
+        else:
+            idx_map = self._ask_oid_idx
         if oid not in idx_map:
             return (0.0, 1.0)
         i = idx_map[oid]
@@ -864,53 +1166,39 @@ class Simulate:
         else:
             return (float(self._ask_log_prices[i]), float(self._ask_delta0s[i]))
 
-    # ═══════════════════════════════════════════════════════════════
-    # Agent interaction helpers
-    # ═══════════════════════════════════════════════════════════════
+    # --- Agent interaction helpers ---
 
     def agent_place_order(self, side, price, volume, t):
-        """Place a limit order on behalf of an agent.
-
-        Registers the order in the book and agent_oids (so background
-        CXLs skip it).
-        Injects the corresponding LO event into the Hawkes process.
-
-        Parameters
-        ----------
-        side : int   — 1 = bid, 2 = ask.
-        price : int  — Price in ticks.
-        volume : int — Order size (shares).
-        t : float    — Current simulation time.
-
-        Returns
-        -------
-        int — The new order ID.
-        """
+        """Place a limit order on behalf of an agent."""
         oid = self.next_id()
         self.ob.add(oid, side, price, volume)
         self.agent_oids.add(oid)
 
         bb, ba = self.ob.get_bbo()
-        log_price = np.log(price) if price > 0 else 0.0
+        if price > 0:
+            log_price = log(price)
+        else:
+            log_price = 0.0
 
         if side == 1:
-            delta0_log = (np.log(ba) - log_price) if (ba and ba > 0 and price > 0) else 1.0
+            if ba and ba > 0 and price > 0:
+                delta0_log = log(ba) - log_price
+            else:
+                delta0_log = 1.0
             self._add_order(1, oid, log_price, delta0_log, t)
             self.inject_event(t, "LO_bid")
         else:
-            delta0_log = (log_price - np.log(bb)) if (bb and bb > 0 and price > 0) else 1.0
+            if bb and bb > 0 and price > 0:
+                delta0_log = log_price - log(bb)
+            else:
+                delta0_log = 1.0
             self._add_order(2, oid, log_price, delta0_log, t)
             self.inject_event(t, "LO_ask")
 
         return oid
 
     def agent_cancel_order(self, oid, t):
-        """Cancel an agent's resting order.
-
-        Removes from book, agent_oids, and injects CXL.
-
-        Returns True if the order was found and removed.
-        """
+        """Cancel an agent's resting order."""
         if oid not in self.ob.order_map:
             self.agent_oids.discard(oid)
             self._remove_order(1, oid)
@@ -930,20 +1218,7 @@ class Simulate:
         return True
 
     def agent_market_order(self, side, volume, t):
-        """Execute a market order on behalf of an agent.
-
-        Walks the opposite side of the book.  Injects MO into Hawkes.
-
-        Parameters
-        ----------
-        side : int   — 1 = buy (lifts asks), 2 = sell (hits bids).
-        volume : int — Order size (shares).
-        t : float    — Current simulation time.
-
-        Returns
-        -------
-        list of (price, qty) — Fills achieved.
-        """
+        """Execute a market order on behalf of an agent."""
         fills = []
         remaining = volume
 
@@ -953,25 +1228,23 @@ class Simulate:
                 bb, ba = self.ob.get_bbo()
                 if ba is None:
                     break
-                filled_any = False
-                for oid in list(self._ask_oid_idx.keys()):
-                    if oid not in self.ob.order_map:
-                        self._remove_order(2, oid)
-                        continue
-                    s, p, vol = self.ob.order_map[oid]
-                    if p == ba:
-                        trade = min(vol, remaining)
-                        remaining -= trade
-                        self.last_trade_price = p
-                        fills.append((p, trade))
-                        self.ob.modify(oid, vol - trade)
-                        if vol - trade <= 0:
-                            self._remove_order(2, oid)
-                            self.agent_oids.discard(oid)
-                        filled_any = True
-                        break
-                if not filled_any:
+                oids_at_ba = self._ask_price_oids.get(ba)
+                if not oids_at_ba:
                     break
+                oid = next(iter(oids_at_ba))
+                if oid not in self.ob.order_map:
+                    oids_at_ba.pop(oid, None)
+                    self._remove_order(2, oid)
+                    continue
+                s, p, vol = self.ob.order_map[oid]
+                trade = min(vol, remaining)
+                remaining -= trade
+                self.last_trade_price = p
+                fills.append((p, trade))
+                self.ob.modify(oid, vol - trade)
+                if vol - trade <= 0:
+                    self._remove_order(2, oid)
+                    self.agent_oids.discard(oid)
 
         else:  # sell — consume bids
             self.inject_event(t, "MO_ask")
@@ -979,75 +1252,27 @@ class Simulate:
                 bb, ba = self.ob.get_bbo()
                 if bb is None:
                     break
-                filled_any = False
-                for oid in list(self._bid_oid_idx.keys()):
-                    if oid not in self.ob.order_map:
-                        self._remove_order(1, oid)
-                        continue
-                    s, p, vol = self.ob.order_map[oid]
-                    if p == bb:
-                        trade = min(vol, remaining)
-                        remaining -= trade
-                        self.last_trade_price = p
-                        fills.append((p, trade))
-                        self.ob.modify(oid, vol - trade)
-                        if vol - trade <= 0:
-                            self._remove_order(1, oid)
-                            self.agent_oids.discard(oid)
-                        filled_any = True
-                        break
-                if not filled_any:
+                oids_at_bb = self._bid_price_oids.get(bb)
+                if not oids_at_bb:
                     break
+                oid = next(iter(oids_at_bb))
+                if oid not in self.ob.order_map:
+                    oids_at_bb.pop(oid, None)
+                    self._remove_order(1, oid)
+                    continue
+                s, p, vol = self.ob.order_map[oid]
+                trade = min(vol, remaining)
+                remaining -= trade
+                self.last_trade_price = p
+                fills.append((p, trade))
+                self.ob.modify(oid, vol - trade)
+                if vol - trade <= 0:
+                    self._remove_order(1, oid)
+                    self.agent_oids.discard(oid)
 
         return fills
 
-
-    
-    def get_cancel_weight(self, y: float) -> float:
-        """
-        Look up P(C|y) from calibrated distribution.
-        
-        Parameters
-        ----------
-        y : float
-            Relative depth ratio δ(t)/δ₀
-            
-        Returns
-        -------
-        float
-            Cancellation probability weight P(C|y)
-        """
-        if not np.isfinite(y):
-            return self.P_C_Y_MIN
-        
-        if y <= 0:
-            return self.P_C_Y_MIN
-        elif y >= 5:
-            return self.P_C_Y_MAX
-        else:
-            # Find bin index
-            bin_idx = np.digitize([y], self.P_C_Y_BINS)[0] - 1
-            bin_idx = max(0, min(bin_idx, len(self.P_C_GIVEN_Y) - 1))
-            return self.P_C_GIVEN_Y[bin_idx]
-
-    def _queue_position_weight(self, f):
-        """Unnormalized Beta(α, β) kernel for queue-position weighting.
-
-        Parameters
-        ----------
-        f : float
-            Fractional queue position in (0, 1).  0 = front, 1 = back.
-        """
-        a = self.queue_cancel_alpha - 1.0   # 7.1029
-        b = self.queue_cancel_beta  - 1.0   # -0.3415
-        return f ** a * (1.0 - f) ** b
-
     def _compute_cancel_weights(self, side):
-        """Compute P(C|y) x Q(f) weights for all orders on one side.
-
-        Pure numpy — no Python loops. Order data lives in pre-allocated arrays;
-        queue ranking uses numpy argsort (C-level O(n log n)).
-        """
         if side == 1:
             n = self._bid_n
             oids = self._bid_oids[:n]
@@ -1058,9 +1283,10 @@ class Simulate:
         if n == 0:
             return np.empty(0, dtype=np.int64), np.array([]), np.array([]), np.array([])
 
-        # Evict stale entries (oid no longer in the order book).
-        # swap-and-pop invalidates the slice, so re-read afterwards.
-        stale = [int(o) for o in oids if int(o) not in self.ob.order_map]
+        # Evict stale entries using set operations
+        oid_list = oids.tolist()
+        order_map_keys = self.ob.order_map
+        stale = [o for o in oid_list if o not in order_map_keys]
         if stale:
             for so in stale:
                 self._remove_order(side, so)
@@ -1082,9 +1308,11 @@ class Simulate:
             times      = self._ask_times[:n]
             oids       = self._ask_oids[:n]
 
-        opp_log = self.last_log_best_ask if side == 1 else self.last_log_best_bid
+        if side == 1:
+            opp_log = self.last_log_best_ask
+        else:
+            opp_log = self.last_log_best_bid
 
-        # Vectorized y computation
         if opp_log is not None:
             if side == 1:
                 y_vals = np.where(delta0s != 0, (opp_log - log_prices) / delta0s, 1.0)
@@ -1093,19 +1321,16 @@ class Simulate:
         else:
             y_vals = np.ones(n)
 
-        # Vectorized P(C|y) lookup
         y_clipped = np.clip(y_vals, 0.0, 5.0)
-        bin_idx = np.digitize(y_clipped, self.P_C_Y_BINS) - 1
-        np.clip(bin_idx, 0, len(self.P_C_GIVEN_Y) - 1, out=bin_idx)
-        pcy_weights = self.P_C_GIVEN_Y[bin_idx]
-        pcy_weights = np.where(np.isfinite(y_vals) & (y_vals > 0), pcy_weights, self.P_C_Y_MIN)
+        bin_idx = np.digitize(y_clipped, self.cancel_y_bins) - 1
+        np.clip(bin_idx, 0, len(self.cancel_prob_by_y) - 1, out=bin_idx)
+        pcy_weights = self.cancel_prob_by_y[bin_idx]
+        pcy_weights = np.where(np.isfinite(y_vals) & (y_vals > 0), pcy_weights, self.cancel_prob_y_min)
 
-        # Queue position via numpy argsort (C-level, ~50x faster than Python iteration)
         rank_order = np.argsort(times)
         f_values = np.empty(n)
         f_values[rank_order] = (np.arange(n, dtype=np.float64) + 0.5) / n
 
-        # Vectorized queue-position weight
         a = self.queue_cancel_alpha - 1.0
         b = self.queue_cancel_beta - 1.0
         queue_weights = f_values ** a * (1.0 - f_values) ** b
@@ -1114,7 +1339,6 @@ class Simulate:
         return oids.copy(), combined, y_vals, f_values
 
     def plot_book(self, title: str = "Initial Order Book") -> None:
-        """Bar chart of aggregate volume per price level in a window around the BBO."""
         ts = self.tick_size
         bids = {}
         asks = {}
@@ -1139,9 +1363,9 @@ class Simulate:
         w = ts * 0.85
         fig, ax = plt.subplots(figsize=(12, 5))
         ax.bar(bids_plot.index, bids_plot.values, width=w,
-               color="#1f77b4", label="Bids")
+               color="steelblue", label="Bids")
         ax.bar(asks_plot.index, asks_plot.values, width=w,
-               color="#ff7f0e", label="Asks")
+               color="darkorange", label="Asks")
         ax.axvline(bb_pln, color="grey", ls="--", lw=0.8)
         ax.axvline(ba_pln, color="grey", ls="--", lw=0.8)
         ax.set_title(title)
@@ -1163,34 +1387,15 @@ class Simulate:
         tick_size: float = None,
         orders_dir: Optional[Union[str, Path]] = None,
     ) -> None:
-        """
-        Load a real orderbook snapshot from WSE HDF5 data and initialize the simulation.
-
-        Requires **PyTables** (``pip install tables``) for ``pandas.read_hdf``.
-
-        Parameters
-        ----------
-        asset : str
-            Asset name (KGHM, PKNORLEN, PKOBP, etc.)
-        day_key : str
-            Day key in HDF5 file (e.g. ``'d20170110'``)
-        snapshot_time : str
-            Time to snapshot the book (e.g. ``'10:00:00'``)
-        tick_size : float, optional
-            Tick size for price conversion. If omitted, uses ``self.tick_size``.
-        orders_dir : path-like, optional
-            Directory containing ``{asset}_lob_2017_zlib.h5``. If omitted, uses
-            ``data/WSELOB-2017/orders`` inside the package root.
-        """
-        if tick_size is None:
-            tick_size = self.tick_size
+        """Load a real orderbook snapshot from WSE HDF5 data."""
         if orders_dir is None:
             orders_dir = project_root() / "data" / "WSELOB-2017" / "orders"
         else:
             orders_dir = Path(orders_dir)
         orders_file = orders_dir / f"{asset}_lob_2017_zlib.h5"
 
-        print(f"Loading {asset} orders for {day_key}...")
+        if self.verbose:
+            print(f"Loading {asset} orders for {day_key}...")
 
         df = pd.read_hdf(orders_file, f"/{day_key}")
         df = df.copy()
@@ -1205,7 +1410,8 @@ class Simulate:
         day_start = df["time"].iloc[0].normalize()
         cutoff_time = day_start + pd.to_timedelta(snapshot_time)
 
-        print(f"Replaying orders up to {cutoff_time}...")
+        if self.verbose:
+            print(f"Replaying orders up to {cutoff_time}...")
 
         real_ob = HeapOrderBook()
 
@@ -1251,17 +1457,20 @@ class Simulate:
         if real_bb is None or real_ba is None:
             raise ValueError("Real orderbook has no valid BBO at snapshot time!")
 
-        print(
-            f"Real BBO at snapshot: bid={real_bb:.2f}, ask={real_ba:.2f}, "
-            f"spread={real_ba - real_bb:.2f}"
-        )
-        print(f"Real book has {len(real_ob.order_map)} orders")
+        if self.verbose:
+            print(
+                f"Real BBO at snapshot: bid={real_bb:.2f}, ask={real_ba:.2f}, "
+                f"spread={real_ba - real_bb:.2f}"
+            )
+            print(f"Real book has {len(real_ob.order_map)} orders")
 
         self.ob.clear()
         self._bid_n = 0
         self._bid_oid_idx.clear()
         self._ask_n = 0
         self._ask_oid_idx.clear()
+        self._bid_price_oids.clear()
+        self._ask_price_oids.clear()
 
         max_real_oid = 0
         n_bids = 0
@@ -1276,7 +1485,10 @@ class Simulate:
 
         for real_oid, (side, price, volume) in real_ob.order_map.items():
             price_ticks = int(round(price / tick_size))
-            log_price = np.log(price_ticks)
+            if price_ticks > 0:
+                log_price = log(price_ticks)
+            else:
+                log_price = 0.0
 
             oid = real_oid
             max_real_oid = max(max_real_oid, oid)
@@ -1291,16 +1503,16 @@ class Simulate:
 
             if opp_best_at_placement is not None:
                 opp_best_ticks_0 = int(round(opp_best_at_placement / tick_size))
-                log_opp_0 = np.log(max(opp_best_ticks_0, 1))
+                log_opp_0 = log(max(opp_best_ticks_0, 1))
             else:
                 log_opp_0 = None
 
             if side == 1:
                 if log_opp_0 is not None:
                     delta0_log = log_opp_0 - log_price
-                    delta_now = np.log(ba_ticks_snap) - log_price
+                    delta_now = log(ba_ticks_snap) - log_price
                 else:
-                    delta0_log = np.log(ba_ticks_snap) - log_price
+                    delta0_log = log(ba_ticks_snap) - log_price
                     delta_now = delta0_log
 
                 if delta0_log > 0:
@@ -1313,9 +1525,9 @@ class Simulate:
             else:
                 if log_opp_0 is not None:
                     delta0_log = log_price - log_opp_0
-                    delta_now = log_price - np.log(bb_ticks_snap)
+                    delta_now = log_price - log(bb_ticks_snap)
                 else:
-                    delta0_log = log_price - np.log(bb_ticks_snap)
+                    delta0_log = log_price - log(bb_ticks_snap)
                     delta_now = delta0_log
 
                 if delta0_log > 0:
@@ -1332,80 +1544,95 @@ class Simulate:
 
         bb_final, ba_final = self.ob.get_bbo()
         if ba_final is not None and ba_final > 0:
-            self.last_log_best_ask = np.log(ba_final)
+            self.last_log_best_ask = log(ba_final)
         if bb_final is not None and bb_final > 0:
-            self.last_log_best_bid = np.log(bb_final)
+            self.last_log_best_bid = log(bb_final)
 
         d = len(self.labels)
-        self._A_list = [np.zeros((d, d)) for _ in range(self._n_kernels)]
+        self._A_stack = np.zeros((self._n_kernels, d, d))
         if hawkes_events:
             self._t_last = hawkes_events[0][0]
             for ev_time, ev_dim in hawkes_events:
-                self._record_event(ev_time, ev_dim)
+                self._t_last = _record_event_jit(
+                    self._A_stack, self._decay_stack, self._t_last, ev_time, ev_dim, self._n_kernels
+                )
             dt_to_zero = 0.0 - self._t_last
             if dt_to_zero > 0:
-                for k in range(self._n_kernels):
-                    self._A_list[k] *= np.exp(-self._decays_list[k] * dt_to_zero)
+                _decay_A_stack(self._A_stack, self._decay_stack, dt_to_zero, self._n_kernels)
             self._t_last = 0.0
         else:
             self._t_last = 0.0
 
-        self._A_seeded = [A.copy() for A in self._A_list]
+        self._A_seeded = self._A_stack.copy()
 
         intensities_0, _ = self._compute_intensities(0.0)
 
         event_counts = np.bincount([dim for _, dim in hawkes_events], minlength=d)
 
-        print(f"\nLoaded {n_bids} bids, {n_asks} asks into simulation")
-        print(f"order_id_counter starts at {self.order_id_counter}")
+        if self.verbose:
+            print(f"\nLoaded {n_bids} bids, {n_asks} asks into simulation")
+            print(f"order_id_counter starts at {self.order_id_counter}")
 
-        bid_depth = sum(
-            self.ob.order_map[oid][2]
-            for oid in self._bid_oid_idx
-            if oid in self.ob.order_map
-        )
-        ask_depth = sum(
-            self.ob.order_map[oid][2]
-            for oid in self._ask_oid_idx
-            if oid in self.ob.order_map
-        )
-        print(f"Bid depth: {bid_depth:,}, Ask depth: {ask_depth:,}")
-
-        y_arr = np.array(y_values)
-        print("\nPre-existing order y distribution:")
-        print(
-            f"  mean={y_arr.mean():.2f}, median={np.median(y_arr):.2f}, "
-            f"min={y_arr.min():.2f}, max={y_arr.max():.2f}"
-        )
-        print(f"  y < 0.5 (near execution): {(y_arr < 0.5).sum()}")
-        print(
-            f"  0.5 ≤ y ≤ 1.5 (near placement): "
-            f'{((y_arr >= 0.5) & (y_arr <= 1.5)).sum()}'
-        )
-        print(f"  y > 1.5 (stranded): {(y_arr > 1.5).sum()}")
-
-        print(f"\nHawkes seeded with {len(hawkes_events):,} real events:")
-        for i, label in enumerate(self.labels):
-            print(f"  {label:>10}: {event_counts[i]:>7,} events")
-        print("\nInitial intensities at t=0 (baseline → seeded):")
-        for i, label in enumerate(self.labels):
-            print(
-                f"  λ({label:>7}) = {intensities_0[i]:.6f}  "
-                f"(baseline {self._baseline[i]:.6f},  "
-                f"excitation +{intensities_0[i] - self._baseline[i]:.6f})"
+            bid_depth = sum(
+                self.ob.order_map[oid][2]
+                for oid in self._bid_oid_idx
+                if oid in self.ob.order_map
             )
+            ask_depth = sum(
+                self.ob.order_map[oid][2]
+                for oid in self._ask_oid_idx
+                if oid in self.ob.order_map
+            )
+            print(f"Bid depth: {bid_depth:,}, Ask depth: {ask_depth:,}")
+
+            y_arr = np.array(y_values)
+            print("\nPre-existing order y distribution:")
+            print(
+                f"  mean={y_arr.mean():.2f}, median={np.median(y_arr):.2f}, "
+                f"min={y_arr.min():.2f}, max={y_arr.max():.2f}"
+            )
+            print(f"  y < 0.5 (near execution): {(y_arr < 0.5).sum()}")
+            print(
+                f"  0.5 ≤ y ≤ 1.5 (near placement): "
+                f'{((y_arr >= 0.5) & (y_arr <= 1.5)).sum()}'
+            )
+            print(f"  y > 1.5 (stranded): {(y_arr > 1.5).sum()}")
+
+            print(f"\nHawkes seeded with {len(hawkes_events):,} real events:")
+            for i, label in enumerate(self.labels):
+                print(f"  {label:>10}: {event_counts[i]:>7,} events")
+            print("\nInitial intensities at t=0 (baseline → seeded):")
+            for i, label in enumerate(self.labels):
+                print(
+                    f"  λ({label:>7}) = {intensities_0[i]:.6f}  "
+                    f"(baseline {self._baseline[i]:.6f},  "
+                    f"excitation +{intensities_0[i] - self._baseline[i]:.6f})"
+                )
 
     def sample_passive_depth(self):
-        """Sample relative price distance (ticks behind best) from power-law."""
         u = random.random()
         depth = int(self.xmin_depth * (1 - u) ** (-1 / (self.beta_depth - 1)))
         return max(1, depth)
-    
-    def order_regime(self, spread):
 
-        # probabilities approximated from empirical calibration results
-        p_best = 0.1
-        p_inside = min(0.5, max(0, spread * 0.03317993 + 0.01994101))
+    def order_regime(self, spread, resil_mult=1.0):
+        p_best = self.lo_p_best
+        if spread < 2:
+            p_inside = 0.0  # no interior tick exists at a 1-tick spread
+        else:
+            if spread <= self.lo_inside_break:
+                raw = spread * self.lo_inside_c1 + self.lo_inside_c0
+            else:
+                raw = spread * self.lo_inside_c1_hi + self.lo_inside_c0_hi
+            p_inside = self.lo_inside_spread_scale * min(0.5, max(0.0, raw))
+
+        if resil_mult != 1.0:
+            p_best *= resil_mult
+            p_inside *= resil_mult
+            tot = p_best + p_inside
+            if tot > self.resil_pmax:
+                shrink = self.resil_pmax / tot
+                p_best *= shrink
+                p_inside *= shrink
 
         r = random.random()
 
@@ -1416,209 +1643,174 @@ class Simulate:
         else:
             return "passive"
 
-    def _compute_regime_masses(self, x_min: float, x_trans: float, x_max: float, alpha1: float, alpha2: float):
+    def _resil_multiplier(self, side, bb, ba):
+        """Placement-aggressiveness multiplier ``1 + tanh(z)`` for the
+        resiliency (stimulated-refill) and trend-chasing placement biases.
+
+        ``z = resil_kappa * x - resil_phi * sgn * trend`` where ``x`` is the
+        side-signed band-pass displacement ``mid - 2*EMA_tau + EMA_2tau``
+        (responds fully to a sudden move, decays over ~1.4*tau, identically
+        zero along a steady trend) and ``trend = EMA_tau - EMA_flow`` (zero
+        at a jump, builds only when a move persists).  ``x > 0`` means
+        placing on *side* at/inside the touch would revert the displacement.
+        The ``1 +/- tanh(z)`` pair keeps the two-side aggregate aggressive
+        placement rate unchanged.  Returns 1.0 when disabled.
         """
-        Compute the probability mass in each regime for a continuous 
-        two-regime TRUNCATED power-law distribution.
-        
-        PDF: p(x) ∝ x^α₁ for x ∈ [x_min, x_trans]
-            p(x) ∝ x^α₂ for x ∈ [x_trans, x_max]  (with continuity at x_trans)
-        
-        The PDF is continuous at x_trans, so:
-        c₁ * x_trans^α₁ = c₂ * x_trans^α₂
-        
-        Returns
-        -------
-        p_mid : float
-            Probability mass in mid regime [x_min, x_trans]
-        p_tail : float
-            Probability mass in tail regime [x_trans, x_max]
-        """
+        if self._resil_ema is None:
+            return 1.0
+        if side == "ask":
+            side_sign = 1.0
+        else:
+            side_sign = -1.0
+        z = 0.0
+        if self.resil_kappa != 0.0:
+            dev = (bb + ba) * 0.5 - 2.0 * self._resil_ema + self._resil_ema2
+            x = side_sign * dev
+            if x > self.resil_xcap:
+                x = self.resil_xcap
+            elif x < -self.resil_xcap:
+                x = -self.resil_xcap
+            z += self.resil_kappa * x
+        if self.resil_phi != 0.0:
+            trend = self._resil_ema - self._resil_ema_flow
+            # trend > 0 (rising): boost bid-side aggression, suppress ask
+            trend_signal = -side_sign * trend
+            y = trend_signal
+            if y > self.resil_xcap:
+                y = self.resil_xcap
+            elif y < -self.resil_xcap:
+                y = -self.resil_xcap
+            z += self.resil_phi * y
+        if z == 0.0:
+            return 1.0
+        # Rate-preserving form: the two sides get (1 + tanh z) and
+        # (1 - tanh z), so the *total* at-best/inside placement rate is
+        # unchanged and only its side composition shifts.  A plain exp(z)
+        # would inflate the aggregate aggressive-placement rate (Jensen),
+        # inflating C(1s) flicker variance and depressing every VR ratio.
+        return 1.0 + tanh(z)
+
+    def _compute_regime_masses(self, x_min, x_trans, x_max, alpha1, alpha2):
         a1 = alpha1 + 1
         a2 = alpha2 + 1
-        
-        # Integral of x^α₁ over [x_min, x_trans]
+
         if abs(a1) < 1e-10:
-            I_mid = np.log(x_trans) - np.log(x_min)
+            I_mid = log(x_trans) - log(x_min)
         else:
             I_mid = (x_trans**a1 - x_min**a1) / a1
-        
-        # Integral of (x_trans^(α₁-α₂)) * x^α₂ over [x_trans, x_max]
-        # The continuity factor is x_trans^(α₁-α₂)
-        # Integral of x^α₂ over [x_trans, x_max] = (x_max^(α₂+1) - x_trans^(α₂+1)) / (α₂+1)
+
         if abs(a2) < 1e-10:
-            I_tail_raw = np.log(x_max) - np.log(x_trans)
+            I_tail_raw = log(x_max) - log(x_trans)
         else:
             I_tail_raw = (x_max**a2 - x_trans**a2) / a2
-        
-        # Apply continuity factor: c₁/c₂ = x_trans^(α₂-α₁)
-        # The integral in terms of the mid-regime normalisation:
+
         I_tail = x_trans**(a1 - a2) * I_tail_raw
-        
+
         total = I_mid + I_tail
         return I_mid / total, I_tail / total
 
-    def _sample_power_law(self, x_min: float, x_max: float, alpha: float) -> int:
-        """
-        Sample from a truncated power-law distribution.
-        
-        PDF: p(x) ∝ x^α  for x in [x_min, x_max]
-        
-        Parameters
-        ----------
-        x_min : float
-            Minimum value (lower bound)
-        x_max : float
-            Maximum value (upper bound)
-        alpha : float
-            Power-law exponent (slope in log-log space)
-            
-        Returns
-        -------
-        int
-            Sampled value (rounded to integer)
-        """
+    def _sample_power_law(self, x_min, x_max, alpha):
         u = random.random()
-        
+
         if abs(alpha + 1) < 1e-10:
-            # Special case: α ≈ -1 → log-uniform
-            log_min = np.log(x_min)
-            log_max = np.log(x_max)
+            log_min = log(x_min)
+            log_max = log(x_max)
             return int(np.exp(log_min + u * (log_max - log_min)))
-        
-        # General power-law inverse CDF
-        # For truncated power-law: x = [x_min^(α+1) + u*(x_max^(α+1) - x_min^(α+1))]^(1/(α+1))
+
         a = alpha + 1
         x_min_a = x_min ** a
         x_max_a = x_max ** a
-        
+
         x = (x_min_a + u * (x_max_a - x_min_a)) ** (1.0 / a)
         return max(1, int(x))
 
     def sample_order_size(self, order_type: str = "LO") -> int:
-        """
-        Sample order size from a continuous two-regime TRUNCATED power-law distribution.
-        
-        The probability of being in each regime is DERIVED from the slopes
-        and transition point (not an arbitrary parameter).
-        
-        Both regimes are truncated (capped at empirical max from calibration data).
-        
-        Parameters
-        ----------
-        order_type : str
-            'LO' for limit orders, 'MO' for market orders
-            
-        Returns
-        -------
-        int
-            Sampled order size (number of shares)
-        """
-        
-        # Select parameters based on order type
         if order_type == "MO":
-            mid_min = self.MO_MID_MIN
-            mid_max = self.MO_MID_MAX
-            mid_slope = self.MO_MID_SLOPE
-            tail_slope = self.MO_TAIL_SLOPE
-            tail_max = self.MO_TAIL_MAX
-        else:  # LO (default)
-            mid_min = self.LO_MID_MIN
-            mid_max = self.LO_MID_MAX
-            mid_slope = self.LO_MID_SLOPE
-            tail_slope = self.LO_TAIL_SLOPE
-            tail_max = self.LO_TAIL_MAX
-        
-        # Compute probability mass in each regime (derived from distribution shape)
-        p_mid, p_tail = self._compute_regime_masses(mid_min, mid_max, tail_max, mid_slope, tail_slope)
-        
-        r = random.random()
-        
-        # -------------------------
-        # Mid regime (truncated power-law with slope α_mid)
-        # -------------------------
-        if r < p_mid:
-            volume =  self._sample_power_law(mid_min, mid_max, mid_slope)
-        
-        # -------------------------
-        # Tail regime (truncated power-law with slope α_tail)
-        # -------------------------
+            mid_min = self.mo_mid_min
+            mid_max = self.mo_mid_max
+            mid_slope = self.mo_mid_slope
+            tail_slope = self.mo_tail_slope
+            tail_max = self.mo_tail_max
         else:
-            volume =  self._sample_power_law(mid_max, tail_max, tail_slope)
-        
-        return volume
+            mid_min = self.lo_mid_min
+            mid_max = self.lo_mid_max
+            mid_slope = self.lo_mid_slope
+            tail_slope = self.lo_tail_slope
+            tail_max = self.lo_tail_max
 
-    # ── helpers for the ticks-walked MO size model ──────────────
+        p_mid, p_tail = self._compute_regime_masses(mid_min, mid_max, tail_max, mid_slope, tail_slope)
+
+        r = random.random()
+
+        if r < p_mid:
+            return self._sample_power_law(mid_min, mid_max, mid_slope)
+        else:
+            return self._sample_power_law(mid_max, tail_max, tail_slope)
+
+    # --- Ticks-walked MO size model helpers ---
+
+    def _background_qty(self, qty_dict, side_int):
+        """Return a copy of *qty_dict* with agent order volumes subtracted."""
+        if not self.agent_oids:
+            return qty_dict
+        agent_vol = {}
+        for oid in self.agent_oids:
+            entry = self.ob.order_map.get(oid)
+            if entry is not None and entry[0] == side_int:
+                p = entry[1]
+                agent_vol[p] = agent_vol.get(p, 0) + entry[2]
+        if not agent_vol:
+            return qty_dict
+        result = dict(qty_dict)
+        for p, av in agent_vol.items():
+            if p in result:
+                result[p] = max(0, result[p] - av)
+                if result[p] == 0:
+                    del result[p]
+        return result
 
     def _opposite_level_volumes(self, qty_dict, best_price, side, n_levels=10):
-        """Return a list of volumes at the first *n_levels* on the given side.
-
-        Parameters
-        ----------
-        qty_dict : dict
-            Price → volume mapping (e.g. ``self.ob.ask_qty``).
-        best_price : int or float
-            Current best price on this side.
-        side : str
-            ``"ask"`` (prices increase) or ``"bid"`` (prices decrease).
-        n_levels : int
-            Number of levels to collect.
-
-        Returns
-        -------
-        list[int]
-            Volumes at each level (0-indexed from the best).
-        """
         if best_price is None or not qty_dict:
             return []
-        direction = +1 if side == "ask" else -1
+        if side == "ask":
+            direction = +1
+        else:
+            direction = -1
         return [qty_dict.get(best_price + i * direction, 0) for i in range(n_levels)]
 
     def _sample_truncated_mo(self, lo, hi):
-        """Sample from the unconditional MO size distribution truncated to [lo, hi].
-
-        Uses direct power-law inverse CDF on the interval, which avoids the
-        catastrophic precision loss that occurs when routing through the
-        full-distribution CDF/PPF in the extreme tail.
-        """
         if lo > hi:
-            return lo  # degenerate range
+            return lo
 
-        x_trans = self.MO_MID_MAX  # regime boundary (200)
+        x_trans = self.mo_mid_max
 
         if hi <= x_trans:
-            # Entirely in mid regime
-            return self._sample_power_law(lo, hi, self.MO_MID_SLOPE)
+            return self._sample_power_law(lo, hi, self.mo_mid_slope)
         elif lo >= x_trans:
-            # Entirely in tail regime
-            return self._sample_power_law(lo, hi, self.MO_TAIL_SLOPE)
+            return self._sample_power_law(lo, hi, self.mo_tail_slope)
         else:
-            # Spans both regimes — compute mass in each and pick regime
-            a1 = self.MO_MID_SLOPE + 1
-            a2 = self.MO_TAIL_SLOPE + 1
-            I_mid = (x_trans ** a1 - lo ** a1) / a1 if abs(a1) > 1e-10 \
-                else np.log(x_trans / lo)
-            I_tail_raw = (hi ** a2 - x_trans ** a2) / a2 if abs(a2) > 1e-10 \
-                else np.log(hi / x_trans)
+            a1 = self.mo_mid_slope + 1
+            a2 = self.mo_tail_slope + 1
+            if abs(a1) > 1e-10:
+                I_mid = (x_trans ** a1 - lo ** a1) / a1
+            else:
+                I_mid = log(x_trans / lo)
+            if abs(a2) > 1e-10:
+                I_tail_raw = (hi ** a2 - x_trans ** a2) / a2
+            else:
+                I_tail_raw = log(hi / x_trans)
             I_tail = x_trans ** (a1 - a2) * I_tail_raw
             total = I_mid + I_tail
             if total < 1e-30:
                 return max(lo, min(hi, int(round(
                     lo + random.random() * (hi - lo)))))
             if random.random() < I_mid / total:
-                return self._sample_power_law(lo, x_trans, self.MO_MID_SLOPE)
+                return self._sample_power_law(lo, x_trans, self.mo_mid_slope)
             else:
-                return self._sample_power_law(x_trans, hi, self.MO_TAIL_SLOPE)
+                return self._sample_power_law(x_trans, hi, self.mo_tail_slope)
 
     def sample_MO_size(self, qty_dict, best_price, side):
-        """Sample MO size using the ticks-walked model.
-
-        Returns ``(size, max_ticks)`` so the execution loop can enforce
-        a hard cap on the number of price levels walked.
-
-        Falls back to ``(sample_order_size("MO"), 0)`` when calibration
-        data is missing or the book is empty (tick cap = 0, best-level only).
-        """
+        """Sample MO size using the ticks-walked model."""
         if not self._tw_loaded or best_price is None:
             return self.sample_order_size("MO"), 0
 
@@ -1643,7 +1835,7 @@ class Simulate:
         else:
             bounds = self._tw_depth_bounds
 
-        qi = int(np.searchsorted(bounds, cum_depth))  # 0..3
+        qi = int(np.searchsorted(bounds, cum_depth))
 
         cdf = self._tw_cdfs[qi]
         max_k = len(cdf)
@@ -1654,47 +1846,32 @@ class Simulate:
 
             if k == 0:
                 if levels[0] <= 1:
-                    # Can't partially fill a 1-share level; treat as degenerate
                     continue
                 lo = 1
                 hi = levels[0] - 1
                 break
 
-            # k≥1: MO must clear L0…L(k-1), partial fill at Lk
             lo = max(1, sum(levels[:k]))
             hi = sum(levels[:k + 1]) - 1
-            if hi >= lo:          # levels[k] > 0 → valid bounds
+            if hi >= lo:
                 break
-            # levels[k] is empty → reject, resample k
         else:
-            # all attempts gave degenerate bounds → fall back to k=0
             k = 0
             lo = 1
             hi = max(1, levels[0] - 1)
 
-        # ── sample from truncated unconditional MO distribution ──
         size = self._sample_truncated_mo(lo, hi)
+        k = max(0, int(round(k * self.mo_impact_scale)))
         return size, k
 
     def _queue_accept_prob(self, queue_ahead):
-        """Acceptance probability for placing into a queue of given size (shares).
-
-        Uniform (p=1) for queues ≤ QUEUE_UNIFORM_MAX, then power-law decay.
-        """
-        if queue_ahead <= self.QUEUE_UNIFORM_MAX:
+        if queue_ahead <= self.queue_uniform_max:
             return 1.0
-        return (self.QUEUE_UNIFORM_MAX / queue_ahead) ** self.QUEUE_TAIL_ALPHA
+        return (self.queue_uniform_max / queue_ahead) ** self.queue_tail_alpha
 
     def _sample_passive_with_queue_accept(self, ob, side, bb, ba):
-        """Sample passive depth with accept-reject conditioning on queue size.
-
-        Repeatedly draws a candidate tick-depth from the power-law price
-        distribution, checks the queue already present at that level, and
-        accepts the placement with probability given by the empirical
-        queue-ahead distribution.  Falls back after QUEUE_MAX_RETRIES.
-        """
-        depth = self.sample_passive_depth()          # fallback value
-        for _ in range(self.QUEUE_MAX_RETRIES):
+        depth = self.sample_passive_depth()
+        for _ in range(self.queue_max_retries):
             depth = self.sample_passive_depth()
             if side == "bid":
                 price = bb - depth
@@ -1704,61 +1881,39 @@ class Simulate:
                 queue = ob.ask_qty.get(price, 0)
             if random.random() < self._queue_accept_prob(queue):
                 return depth
-        return depth                                 # accept last sample
+        return depth
 
     def place_limit_price(self, ob, side):
-        """
-        Two-stage order placement:
-        1. Select regime (best / inside / passive)
-        2. For passive: accept-reject on queue size at candidate level
-        """
         bb, ba = ob.get_bbo()
 
         if bb is None or ba is None:
             return None
 
         spread = ba - bb
-        regime = self.order_regime(spread)
+        regime = self.order_regime(spread, self._resil_multiplier(side, bb, ba))
 
-        # -------------------
-        # BID SIDE
-        # -------------------
         if side == "bid":
-
             if regime == "best":
                 return 0
-
             elif regime == "inside":
                 if spread >= 2:
-                    # Improve by 1 tick (penny-jumping), consistent with
-                    # empirical HFT behaviour on most equity LOBs.
                     return -1 * np.random.randint(1, spread)
                 else:
-                    return 0  # Can't go inside, place at best
-
-            else:  # passive
+                    return 0
+            else:
                 return self._sample_passive_with_queue_accept(ob, side, bb, ba)
-
-        # -------------------
-        # ASK SIDE
-        # -------------------
         else:
-
             if regime == "best":
                 return 0
-
             elif regime == "inside":
                 if spread >= 2:
                     return -1 * np.random.randint(1, spread)
                 else:
-                    return 0  # Can't go inside, place at best
-
-            else:  # passive
+                    return 0
+            else:
                 return self._sample_passive_with_queue_accept(ob, side, bb, ba)
-
 
     def _normalize_cancel_sample_weights(self, weights):
-        """Return a valid probability vector for np.random.choice."""
         weights = np.asarray(weights, dtype=float)
         finite = np.isfinite(weights)
         if not finite.all():
@@ -1771,71 +1926,86 @@ class Simulate:
         return weights / wsum
 
     def _execute_mo(self, side_int):
-        """Execute a market order.
-
-        Parameters
-        ----------
-        side_int : int
-            ``1`` = buy MO (walk the ask book); ``2`` = sell MO (walk the bid book).
-        """
+        """Execute a market order using price-to-oid index for O(1) fills."""
         bb, ba = self.ob.get_bbo()
         if side_int == 1:
             if ba is None:
                 return 2
             self.mo_stats['bid_attempts'] += 1
-            size, max_ticks = self.sample_MO_size(self.ob.ask_qty, ba, "ask")
-            self.mo_sizes.append(size)
-            init_size = size
+            sizing_qty = (self._background_qty(self.ob.ask_qty, 2)
+                          if not self.agents_affect_mo_sizing else self.ob.ask_qty)
+            target, max_ticks = self.sample_MO_size(sizing_qty, ba, "ask")
+            self.mo_sizes.append(target)
             initial_ba = ba
             tick_limit = initial_ba + max_ticks
             self._mo_fill_log = []
+            consumed = 0
 
-            while size > 0 and self._ask_n > 0:
+            # Whole-LO matching: consume entire resting orders in price-time
+            # priority until the cumulative consumed volume reaches the
+            # sampled target.  The order that crosses the target is taken in
+            # full (round-up), so an MO never partially fills any LO and the
+            # recorded volume always lands on an order boundary -- which is
+            # what keeps the phantom fill predicate exact for any quote size.
+            while consumed < target and self._ask_n > 0:
                 bb, ba = self.ob.get_bbo()
-                if ba is None:
-                    break
-                if ba > tick_limit:
+                if ba is None or ba > tick_limit:
                     break
 
-                filled = False
-                for oid in list(self._ask_oid_idx.keys()):
-                    if oid not in self.ob.order_map:
-                        self._remove_order(2, oid)
-                        continue
-
-                    side, price, vol = self.ob.order_map[oid]
-                    if price == ba:
-                        trade = min(vol, size)
-                        size -= trade
-                        self.last_trade_price = price
-                        self.ob.modify(oid, vol - trade)
-                        self._mo_fill_log.append((price, trade))
-                        if oid in self.agent_oids:
-                            self._agent_fills.append((oid, price, trade, 2))
-                        if vol - trade <= 0:
-                            start = self._remove_order(2, oid)
-                            duration = self.current_stamp - (start if start is not None else self.current_stamp)
-                            self.lifetimes.append((duration, 'executed'))
-                            self.agent_oids.discard(oid)
-                        filled = True
-                        break
-
-                if not filled:
+                oids_at_ba = self._ask_price_oids.get(ba)
+                if not oids_at_ba:
                     break
+                oid = next(iter(oids_at_ba))
+                if oid not in self.ob.order_map:
+                    oids_at_ba.pop(oid, None)
+                    self._remove_order(2, oid)
+                    continue
+
+                _, price, vol = self.ob.order_map[oid]
+                # Round-to-nearest order boundary, including zero: take this
+                # order only if doing so lands cumulative volume at least as
+                # close to the sampled target as stopping now would.  No
+                # consumed>0 guard, so an MO whose target is <= half the front
+                # order rounds to *zero* impact -- it removes nothing and leaves
+                # the best quote untouched (the whole-LO analogue of the old
+                # small partial nibble).  The event still excited the Hawkes
+                # kernels in _sample_next_event, so this only changes the fill,
+                # not the arrival process.  Keeps whole-LO matching exact and
+                # makes realized volume unbiased w.r.t. target.
+                if (consumed + vol / 2.0) >= target:
+                    break
+                consumed += vol
+                self.last_trade_price = price
+                self._mo_fill_log.append((price, vol))
+                if oid in self.agent_oids:
+                    self._agent_fills.append((oid, price, vol, 2))
+                # Remove from compact arrays / price index first (fast path
+                # while oid is still in order_map), then drop it from the book.
+                start = self._remove_order(2, oid)
+                self.ob.delete(oid)
+                if start is not None:
+                    duration = self.current_stamp - start
+                else:
+                    duration = self.current_stamp - self.current_stamp
+                self.lifetimes.append((duration, 'executed'))
+                self.agent_oids.discard(oid)
 
             _, final_ba = self.ob.get_bbo()
             if final_ba is None:
                 raise RuntimeError(
-                    f"MO_bid of size {init_size} depleted the ask book at t={self.current_time}")
-            tw = int(final_ba - initial_ba) if initial_ba is not None else 0
+                    f"MO_bid (target {target}) depleted the ask book at t={self.current_time}")
+            if initial_ba is not None:
+                tw = int(final_ba - initial_ba)
+            else:
+                tw = 0
             self.mo_ticks_walked.append(max(0, tw))
             self._event_detail = {
                 'type': 'MO', 'side_text': 'buy', 'side_int': 1,
-                'mo_volume': init_size, 'ticks_walked': max(0, tw),
+                'mo_volume': consumed, 'ticks_walked': max(0, tw),
                 'fills': list(self._mo_fill_log),
                 '_pre_bb': bb, '_pre_ba': initial_ba,
             }
-            if size <= 0:
+            if consumed >= target:
                 self.mo_stats['bid_filled'] += 1
             return
 
@@ -1843,59 +2013,65 @@ class Simulate:
             if bb is None:
                 return 2
             self.mo_stats['ask_attempts'] += 1
-            size, max_ticks = self.sample_MO_size(self.ob.bid_qty, bb, "bid")
-            self.mo_sizes.append(size)
-            init_size = size
+            sizing_qty = (self._background_qty(self.ob.bid_qty, 1)
+                          if not self.agents_affect_mo_sizing else self.ob.bid_qty)
+            target, max_ticks = self.sample_MO_size(sizing_qty, bb, "bid")
+            self.mo_sizes.append(target)
             initial_bb = bb
             tick_limit = initial_bb - max_ticks
             self._mo_fill_log = []
+            consumed = 0
 
-            while size > 0 and self._bid_n > 0:
+            # Whole-LO matching (see the buy-side branch above for rationale).
+            while consumed < target and self._bid_n > 0:
                 bb, ba = self.ob.get_bbo()
-                if bb is None:
-                    break
-                if bb < tick_limit:
+                if bb is None or bb < tick_limit:
                     break
 
-                filled = False
-                for oid in list(self._bid_oid_idx.keys()):
-                    if oid not in self.ob.order_map:
-                        self._remove_order(1, oid)
-                        continue
-
-                    side, price, vol = self.ob.order_map[oid]
-                    if price == bb:
-                        trade = min(vol, size)
-                        size -= trade
-                        self.last_trade_price = price
-                        self.ob.modify(oid, vol - trade)
-                        self._mo_fill_log.append((price, trade))
-                        if oid in self.agent_oids:
-                            self._agent_fills.append((oid, price, trade, 1))
-                        if vol - trade <= 0:
-                            start = self._remove_order(1, oid)
-                            duration = self.current_stamp - (start if start is not None else self.current_stamp)
-                            self.lifetimes.append((duration, 'executed'))
-                            self.agent_oids.discard(oid)
-                        filled = True
-                        break
-
-                if not filled:
+                oids_at_bb = self._bid_price_oids.get(bb)
+                if not oids_at_bb:
                     break
+                oid = next(iter(oids_at_bb))
+                if oid not in self.ob.order_map:
+                    oids_at_bb.pop(oid, None)
+                    self._remove_order(1, oid)
+                    continue
+
+                _, price, vol = self.ob.order_map[oid]
+                # Round-to-nearest order boundary, including zero (see buy-side
+                # branch above for the full rationale).
+                if (consumed + vol / 2.0) >= target:
+                    break
+                consumed += vol
+                self.last_trade_price = price
+                self._mo_fill_log.append((price, vol))
+                if oid in self.agent_oids:
+                    self._agent_fills.append((oid, price, vol, 1))
+                start = self._remove_order(1, oid)
+                self.ob.delete(oid)
+                if start is not None:
+                    duration = self.current_stamp - start
+                else:
+                    duration = self.current_stamp - self.current_stamp
+                self.lifetimes.append((duration, 'executed'))
+                self.agent_oids.discard(oid)
 
             final_bb, _ = self.ob.get_bbo()
             if final_bb is None:
                 raise RuntimeError(
-                    f"MO_ask of size {init_size} depleted the bid book at t={self.current_time}")
-            tw = int(initial_bb - final_bb) if initial_bb is not None else 0
+                    f"MO_ask (target {target}) depleted the bid book at t={self.current_time}")
+            if initial_bb is not None:
+                tw = int(initial_bb - final_bb)
+            else:
+                tw = 0
             self.mo_ticks_walked.append(max(0, tw))
             self._event_detail = {
                 'type': 'MO', 'side_text': 'sell', 'side_int': 2,
-                'mo_volume': init_size, 'ticks_walked': max(0, tw),
+                'mo_volume': consumed, 'ticks_walked': max(0, tw),
                 'fills': list(self._mo_fill_log),
                 '_pre_bb': initial_bb, '_pre_ba': ba,
             }
-            if size <= 0:
+            if consumed >= target:
                 self.mo_stats['ask_filled'] += 1
             return
 
@@ -1912,16 +2088,18 @@ class Simulate:
         price = int(bb - relative_price)
 
         if ba is not None and price >= ba:
-            print(f"Adjusting bid price from {price * self.tick_size:.2f} to {(ba - 1) * self.tick_size:.2f} to avoid crossing")
             price = int(ba - 1)
 
         price = max(1, int(price))
 
         if ba is not None and ba > 0 and price > 0:
-            log_price = np.log(price)
-            delta0_log = np.log(ba) - log_price
+            log_price = log(price)
+            delta0_log = log(ba) - log_price
         else:
-            log_price = np.log(price) if price > 0 else 0.0
+            if price > 0:
+                log_price = log(price)
+            else:
+                log_price = 0.0
             delta0_log = 1.0
         oid = self.next_id()
         self.ob.add(oid, 1, price, size)
@@ -1948,16 +2126,18 @@ class Simulate:
         bb, ba = self.ob.get_bbo()
         price = int(ba + relative_price)
         if bb is not None and price <= bb:
-            print(f"Adjusting ask price from {price * self.tick_size:.2f} to {(bb + 1) * self.tick_size:.2f} to avoid crossing")
             price = int(bb + 1)
 
         price = max(1, int(price))
 
         if bb is not None and bb > 0 and price > 0:
-            log_price = np.log(price)
-            delta0_log = log_price - np.log(bb)
+            log_price = log(price)
+            delta0_log = log_price - log(bb)
         else:
-            log_price = np.log(price) if price > 0 else 0.0
+            if price > 0:
+                log_price = log(price)
+            else:
+                log_price = 0.0
             delta0_log = 1.0
         oid = self.next_id()
         self.ob.add(oid, 2, price, size)
@@ -1976,7 +2156,6 @@ class Simulate:
         }
 
     def _execute_cxl(self, side, bb, ba):
-        """Cancel a resting order on ``side`` (1 = bid, 2 = ask)."""
         if side == 1:
             self.cancel_stats['bid_attempts'] += 1
         elif side == 2:
@@ -1984,7 +2163,10 @@ class Simulate:
         else:
             raise ValueError(f"_execute_cxl: side must be 1 or 2, got {side!r}")
 
-        n_side = self._bid_n if side == 1 else self._ask_n
+        if side == 1:
+            n_side = self._bid_n
+        else:
+            n_side = self._ask_n
         if n_side == 0:
             return
 
@@ -2036,12 +2218,13 @@ class Simulate:
             cxl_tfb = max(0, int(cxl_price - (ba or 0)))
             cxl_qa = self.ob.ask_qty.get(cxl_price, 0)
 
-        removed = self.ob.delete(chosen_oid)
-        if not removed:
-            print(f"cancellation: oid {chosen_oid} not found in book")
+        self.ob.delete(chosen_oid)
 
         start = self._remove_order(side, chosen_oid)
-        duration = self.current_stamp - (start if start is not None else self.current_stamp)
+        if start is not None:
+            duration = self.current_stamp - start
+        else:
+            duration = self.current_stamp - self.current_stamp
         self.lifetimes.append((duration, 'canceled'))
         if side == 1:
             self.cancel_stats['bid_success'] += 1
@@ -2055,27 +2238,17 @@ class Simulate:
             'ticks_from_best': cxl_tfb, 'queue_ahead': cxl_qa,
         }
 
-
     def process_event(self, event_type, bb, ba):
-        """
-        Event processing with P(C|y)-weighted cancellation.
-
-        For cancellations, each order is weighted by P(C|y) where
-        y = δ(t) / δ₀, with δ(t) the current distance from the opposite best
-        quote and δ₀ the distance when the order was placed.
-        P(C|y) is computed on the fly in _compute_cancel_weights.
-        """
-        self._event_detail = None  # reset; set below if event modifies book
+        self._event_detail = None
 
         spread = None
         if bb is not None and ba is not None:
             spread = ba - bb
 
-        # Track log BBO for cancel-weight y computation
         if ba is not None and ba > 0:
-            self.last_log_best_ask = np.log(ba)
+            self.last_log_best_ask = log(ba)
         if bb is not None and bb > 0:
-            self.last_log_best_bid = np.log(bb)
+            self.last_log_best_bid = log(bb)
 
         if event_type == "MO_bid":
             r = self._execute_mo(1)
@@ -2098,16 +2271,23 @@ class Simulate:
         elif event_type == "CXL_ask":
             self._execute_cxl(2, bb, ba)
 
-    def run(self, overwrite=False):
-        # clear previous diagnostics so repeated calls start fresh
+    def run(self, overwrite=False, verbose=None):
+        """Execute the simulation for ``T`` events.
+
+        ``verbose`` overrides ``self.verbose`` for this call when not ``None``;
+        when falsy, the liquidity-guard summary is suppressed (used by the
+        calibration search).
+        """
+        if verbose is None:
+            run_verbose = self.verbose
+        else:
+            run_verbose = bool(verbose)
         self.lifetimes.clear()
         self.lo_stats.clear()
         self.mo_sizes.clear()
         self.mo_ticks_walked.clear()
         self._tw_depth_history.clear()
         self._tw_adaptive_bounds = None
-        self.frames.clear()
-        self.executed_events.clear()
         self.cancel_stats = {'bid_attempts': 0, 'bid_success': 0,
                              'ask_attempts': 0, 'ask_success': 0}
         self.mo_stats = {'bid_attempts': 0, 'bid_filled': 0,
@@ -2116,76 +2296,91 @@ class Simulate:
         self.cancel_f_log.clear()
         self.cancel_dsame_log.clear()
 
-        # Reset liquidity-guard counters
         for k in self._guard_stats:
             self._guard_stats[k] = 0
 
-        # Clear compact buffers
         self._fills_compact.clear()
         self._mo_compact.clear()
+        self._mid_t = []
+        self._mid_v = []
+        _capture_mid = self.capture_mid
+        self._resil_ema = None
+        self._resil_ema2 = None
+        self._resil_ema_flow = None
+        self._resil_t = 0.0
+        _resil_on = (self.resil_kappa != 0.0) or (self.resil_phi != 0.0)
 
         if not self.lightweight:
-            # -- Event database (heavy mode only) --
-            self._orders_buf.clear()
-            self._fills_buf.clear()
             self._mo_buf.clear()
             self._bbo_buf.clear()
-            self._intensities_buf.clear()
+            if self.recording_mode == 'full':
+                self._orders_buf.clear()
+                self._fills_buf.clear()
+                self._intensities_buf.clear()
             self._prev_event_time = None
             self._prev_mid = None
             self._open_db(overwrite=overwrite)
 
-        self.last_trade_price = None  # reset trade tracker
+        self.last_trade_price = None
 
-        # Restore Hawkes auxiliary state (seeded state if set, else cold).
         d = len(self.labels)
         if hasattr(self, '_A_seeded') and self._A_seeded is not None:
-            self._A_list = [A.copy() for A in self._A_seeded]
+            self._A_stack = self._A_seeded.copy()
         else:
-            self._A_list = [np.zeros((d, d)) for _ in range(self._n_kernels)]
+            self._A_stack = np.zeros((self._n_kernels, d, d))
         self._t_last = 0.0
-
-        _diag_evt = {"LO_bid": 0, "LO_ask": 0, "CXL_bid": 0, "CXL_ask": 0,
-                     "MO_bid": 0, "MO_ask": 0}
-        _diag_guard_remap = 0
 
         for counter in range(1, self.T + 1):
 
-            # Sample next event on the fly (Ogata thinning)
             t, label, intensities = self._sample_next_event()
-            raw_label = label
             if self.liquidity_guard:
                 label = self._guard_event(label)
-                if label != raw_label:
-                    _diag_guard_remap += 1
 
-            _diag_evt[label] = _diag_evt.get(label, 0) + 1
-
-            if counter % 50_000 == 0:
-                print(f"[{counter:>7d}]  bid_d={self.ob.total_bid_depth:>10,.0f}  "
-                      f"ask_d={self.ob.total_ask_depth:>10,.0f}  "
-                      f"n_bid={self._bid_n:>5d}  n_ask={self._ask_n:>5d}  "
-                      f"LO={_diag_evt['LO_bid']+_diag_evt['LO_ask']:>6d}  "
-                      f"CXL={_diag_evt['CXL_bid']+_diag_evt['CXL_ask']:>6d}  "
-                      f"MO={_diag_evt['MO_bid']+_diag_evt['MO_ask']:>6d}  "
-                      f"guard_remap={_diag_guard_remap}")
-
-            if not self.lightweight and self._db_conn is not None:
+            if self.recording_mode == 'full' and self._db_conn is not None:
                 self._intensities_buf.append((t, *intensities))
 
-            # expose current time and index for lifetime logging
             self.current_time = t
             self.current_index = counter
             self.current_stamp = t + counter * 1e-9
 
             bb_pre, ba_pre = self.ob.get_bbo()
 
-            if not self.lightweight:
-                # -- Pre-event state for DB --
+            if _capture_mid and bb_pre is not None and ba_pre is not None:
+                self._mid_t.append(t)
+                self._mid_v.append((bb_pre + ba_pre) * 0.5 * self.tick_size)
+
+            if _resil_on and bb_pre is not None and ba_pre is not None:
+                # EMAs of the piecewise-constant mid: the pre-event mid held
+                # over (last update, t], so relax all anchors toward it.
+                mid_pre_ticks = (bb_pre + ba_pre) * 0.5
+                if self._resil_ema is None:
+                    self._resil_ema = mid_pre_ticks
+                    self._resil_ema2 = mid_pre_ticks
+                    self._resil_ema_flow = mid_pre_ticks
+                else:
+                    dtr = t - self._resil_t
+                    if dtr > 0.0:
+                        self._resil_ema = mid_pre_ticks + (
+                            (self._resil_ema - mid_pre_ticks)
+                            * exp(-dtr / self.resil_tau_s))
+                        self._resil_ema2 = mid_pre_ticks + (
+                            (self._resil_ema2 - mid_pre_ticks)
+                            * exp(-dtr / (2.0 * self.resil_tau_s)))
+                        self._resil_ema_flow = mid_pre_ticks + (
+                            (self._resil_ema_flow - mid_pre_ticks)
+                            * exp(-dtr / self.resil_flow_tau_s))
+                self._resil_t = t
+
+            if self.recording_mode == 'full':
                 _pre = (self._snapshot_pre_event(bb_pre, ba_pre)
                         if self._db_conn is not None else None)
+            elif self.recording_mode == 'medium':
+                _pre = (self._snapshot_pre_event(bb_pre, ba_pre)
+                        if self._db_conn is not None and label.startswith('MO')
+                        else None)
+            elif self.recording_mode == 'bbo':
+                _pre = None
 
-            # process event
             self._agent_fills.clear()
             if self.process_event(label, bb_pre, ba_pre) == 2:
                 continue
@@ -2193,11 +2388,15 @@ class Simulate:
 
             if self.agents and (not self.lightweight or self.agents_when_lightweight):
                 fills = list(self._agent_fills)
-                for agent in self.agents:
+                if self.shuffle_agents and len(self.agents) > 1:
+                    agent_iter = list(self.agents)
+                    random.shuffle(agent_iter)
+                else:
+                    agent_iter = self.agents
+                for agent in agent_iter:
                     agent.on_event(self, t, fills)
 
             if self.lightweight:
-                # ── Lightweight recording: compact fills & MO data ──
                 detail = self._event_detail
                 if detail is not None and detail.get('type') == 'MO':
                     bb_now, ba_now = self.ob.get_bbo()
@@ -2211,10 +2410,24 @@ class Simulate:
                     ))
                     for fill_price, fill_vol in detail.get('fills', []):
                         self._fills_compact.append((t, fill_price * ts))
+            elif self.recording_mode == 'medium':
+                if self._db_conn is not None and bb_pre is not None and ba_pre is not None:
+                    if _pre is not None:
+                        self._record_to_db(t, label, _pre, counter)
+                    else:
+                        ts = self.tick_size
+                        mid_pre = (bb_pre + ba_pre) / 2.0
+                        self._bbo_buf.append((t, bb_pre * ts, ba_pre * ts, mid_pre * ts))
+                        if counter % self._flush_every == 0:
+                            self._flush_db()
+            elif self.recording_mode == 'bbo':
+                if self._db_conn is not None and bb_pre is not None and ba_pre is not None:
+                    ts = self.tick_size
+                    mid_pre = (bb_pre + ba_pre) / 2.0
+                    self._bbo_buf.append((t, bb_pre * ts, ba_pre * ts, mid_pre * ts))
+                    if counter % self._flush_every == 0:
+                        self._flush_db()
             else:
-                self.executed_events.append(label)
-
-                # -- Record event to database --
                 if _pre is not None:
                     self._record_to_db(t, label, _pre, counter)
 
@@ -2222,13 +2435,11 @@ class Simulate:
                 if bb is None or ba is None or ba <= bb:
                     continue
 
-        # -- Finalize database --
         if not self.lightweight:
             self._close_db()
 
-        # -- Liquidity-guard summary --
         total_interventions = sum(self._guard_stats.values())
-        if self.liquidity_guard and total_interventions > 0:
+        if run_verbose and self.liquidity_guard and total_interventions > 0:
             pct = 100.0 * total_interventions / self.T
             print(f"\nLiquidity guard: {total_interventions} interventions "
                   f"({pct:.2f}% of {self.T} events)")
@@ -2237,19 +2448,7 @@ class Simulate:
                     print(f"  {k}: {v}")
 
     def get_compact_results(self):
-        """Return compact in-memory results for lightweight runs.
-
-        Returns
-        -------
-        dict with keys:
-            'fills_ts'      : np.ndarray of fill timestamps
-            'fills_price'   : np.ndarray of fill prices
-            'mo_ts'         : np.ndarray of MO timestamps
-            'mo_side'       : np.ndarray of MO sides ('buy'/'sell')
-            'mo_best_bid'   : np.ndarray of best bid at MO time
-            'mo_best_ask'   : np.ndarray of best ask at MO time
-            'mo_ticks_walked' : np.ndarray of ticks walked per MO
-        """
+        """Return compact in-memory results for lightweight runs."""
         fills = self._fills_compact
         mos = self._mo_compact
         return {
@@ -2261,3 +2460,24 @@ class Simulate:
             'mo_best_ask':      np.array([m[3] for m in mos], dtype=np.float64) if mos else np.array([], dtype=np.float64),
             'mo_ticks_walked':  np.array([m[4] for m in mos], dtype=np.int64) if mos else np.array([], dtype=np.int64),
         }
+
+    def get_mid_series(self):
+        """Return the per-event mid series captured in memory during ``run()``.
+
+        Requires ``capture_mid=True`` at construction. Returns ``(t, mid)`` as
+        float64 arrays where ``t`` is event time (s) and ``mid`` is the
+        pre-event mid price in PLN -- the same series the ``bbo`` SQLite table
+        records, but with no disk round-trip (used by the calibration search).
+        """
+        return (
+            np.asarray(self._mid_t, dtype=np.float64),
+            np.asarray(self._mid_v, dtype=np.float64),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Backwards-compatible alias. The Numba engine used to live in a separate
+# ``simulate_fast.py`` as ``SimulateFast``; it is now the one and only engine.
+# Existing imports (``from .simulate import SimulateFast``) keep working.
+# ---------------------------------------------------------------------------
+SimulateFast = Simulate
