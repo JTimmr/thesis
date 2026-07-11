@@ -18,9 +18,11 @@ __pycache__/
 # Extracted event files
 *_events.npz
 
-# WSE raw data and calibration artefacts
-data/WSELOB-2017/
-data/mo_depth_data/
+# Data artefacts: keep only the market-order calibration file
+data/*
+!data/mo_depth_data/
+data/mo_depth_data/*
+!data/mo_depth_data/KGHM_tw_quartiles.npz
 
 # Profiling artifacts
 *.prof
