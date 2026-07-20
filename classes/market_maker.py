@@ -10,7 +10,9 @@ from typing import Optional
 
 import numpy as np
 
-from . import _ergodic_solver as ergodic_solver
+def _get_ergodic_solver():
+    from . import _ergodic_solver
+    return _ergodic_solver
 
 
 def _float_or_nan(value):
@@ -326,7 +328,7 @@ class ErgodicMM:
         Order size placed on each side.
     tick_size : float
         Minimum price increment for rounding quotes.
-    intensity_a : float
+    intensity_A : float
         Market-order arrival intensity A.  Set to 1.0 by convention
         (absorbed into the calibrated k).
     initial_cash : float or None
@@ -337,7 +339,7 @@ class ErgodicMM:
 
     def __init__(self, gamma=1.0, k=1.5,
                  vol_halflife=50, vol_floor=1e-4, size=1, tick_size=1,
-                 intensity_a=1.0, verbose=True,
+                 intensity_A=1.0, verbose=True,
                  initial_cash=None, initial_inventory=0,
                  agent_id=None,
                  vol_mode="ewma_event",
@@ -345,7 +347,7 @@ class ErgodicMM:
         self.agent_id = agent_id
         self.gamma = float(gamma)
         self.k = float(k)
-        self.intensity_a = float(intensity_a)
+        self.intensity_A = float(intensity_A)
         self.size = int(size)
         self.tick_size = float(tick_size)
         self.verbose = verbose
@@ -437,7 +439,7 @@ class ErgodicMM:
 
         g = self.gamma
         k = self.k
-        A = self.intensity_a
+        A = self.intensity_A
         if self.size > 0:
             q = int(round(self.inventory / self.size))
         else:
@@ -816,7 +818,7 @@ class ErgodicMM:
         Returns
         -------
         dict
-            ``{"k": ..., "vol_halflife": ..., "tick_size": ..., "intensity_a": ...}``
+            ``{"k": ..., "vol_halflife": ..., "tick_size": ..., "intensity_A": ...}``
             where ``k`` is in 1/PLN.
         """
         k_tick = cls.calibrate_k(mo_df, tick_size=tick_size)
@@ -825,7 +827,7 @@ class ErgodicMM:
         A = cls.calibrate_A(mo_df, orders_df, tick_size=tick_size)
         return {
             "k": k_pln, "vol_halflife": vol_halflife,
-            "tick_size": tick_size, "intensity_a": A,
+            "tick_size": tick_size, "intensity_A": A,
         }
 
 
@@ -856,7 +858,7 @@ class NumericalErgodicMM:
 
     Parameters
     ----------
-    gamma, k, vol_halflife, vol_floor, size, tick_size, intensity_a,
+    gamma, k, vol_halflife, vol_floor, size, tick_size, intensity_A,
     verbose, initial_cash, initial_inventory, agent_id
         Identical to :class:`ErgodicMM`.
     max_iter : int
@@ -905,7 +907,7 @@ class NumericalErgodicMM:
     Notes
     -----
     The default fill law is the exponential
-    ``lambda(delta) = intensity_a * exp(-k * delta)``, identical to
+    ``lambda(delta) = intensity_A * exp(-k * delta)``, identical to
     :class:`ErgodicMM`.  To use a *state-conditional* fill law (e.g.
     one that reads ``sim.hawkes_filter.intensity(t)`` or the live order
     book depth), pass either a pair of arrival-rate callbacks
@@ -919,13 +921,14 @@ class NumericalErgodicMM:
 
     def __init__(self, gamma=1.0, k=1.5,
                  vol_halflife=50, vol_floor=1e-4, size=1, tick_size=1,
-                 intensity_a=1.0, verbose=True,
+                 intensity_A=1.0, verbose=True,
                  initial_cash=None, initial_inventory=0,
                  agent_id=None,
                  max_iter=50_000, relax_step=0.2, tol=1e-4,
                  delta_lo=-0.50, max_delta=5.0, Q_margin=20,
                  Q_shrink_patience=256,
                  solver_tick=None, solver_engine="scan",
+                 candidate_grid="uniform",
                  # custom fill-law hooks (default: built-in exponential)
                  lam_b=None, lam_a=None, h_b=None, h_a=None,
                  state_extractor=None, poisson_tau=1.0, h_clamp=1e-9,
@@ -934,7 +937,7 @@ class NumericalErgodicMM:
 
         Parameters
         ----------
-        gamma, k, vol_halflife, vol_floor, size, tick_size, intensity_a,
+        gamma, k, vol_halflife, vol_floor, size, tick_size, intensity_A,
         verbose, initial_cash, initial_inventory, agent_id, max_iter,
         relax_step, tol, delta_lo, max_delta, Q_margin
             Solver and book-side knobs (see class docstring).
@@ -956,14 +959,14 @@ class NumericalErgodicMM:
 
         When *none* of ``lam_b/lam_a/h_b/h_a`` is supplied the agent
         falls back to the built-in exponential model
-        ``lambda(delta) = intensity_a * exp(-k * delta)`` and the grid
+        ``lambda(delta) = intensity_A * exp(-k * delta)`` and the grid
         is cached once at construction (state-independent, identical to
         the previous behaviour).
         """
         self.agent_id = agent_id
         self.gamma = float(gamma)
         self.k = float(k)
-        self.intensity_a = float(intensity_a)
+        self.intensity_A = float(intensity_A)
         self.size = int(size)
         self.tick_size = float(tick_size)
         # Internal δ-grid resolution used by the HJB solver.  Decoupled
@@ -1033,6 +1036,12 @@ class NumericalErgodicMM:
             raise ValueError(f"solver_engine must be 'scan' or 'hull', "
                              f"got {solver_engine!r}")
         self.solver_engine = str(solver_engine)
+        if candidate_grid not in ("uniform", "legal"):
+            raise ValueError(
+                "candidate_grid must be 'uniform' or 'legal', "
+                f"got {candidate_grid!r}"
+            )
+        self.candidate_grid = str(candidate_grid)
         self.Q_margin = int(Q_margin)
         # Floor on the inventory half-width.  ``Q`` grows on demand and is
         # reclaimed (shrunk) once the larger grid has gone unused for
@@ -1088,7 +1097,9 @@ class NumericalErgodicMM:
         # when state-dependent hooks are supplied.
         self._dg_b = self._lg_b = None
         self._dg_a = self._lg_a = None
-        if not self._state_dependent:
+        self._pg_b = self._pg_a = None
+        self._legal_dg_b = self._legal_dg_a = None
+        if not self._state_dependent and self.candidate_grid == "uniform":
             self._build_grids(z=None)
 
         self.total_solve_time = 0.0
@@ -1117,31 +1128,90 @@ class NumericalErgodicMM:
         and returns matching shape, so the grid builder takes the fast
         single-call path.
         """
-        return self.intensity_a * np.exp(-self.k * np.asarray(d, dtype=np.float64))
+        return self.intensity_A * np.exp(-self.k * np.asarray(d, dtype=np.float64))
 
-    def _build_grids(self, z):
+    def _legal_candidate_grids(self, sim):
+        """Build side-specific executable prices and midpoint deltas.
+
+        This uses the same legal-tick geometry as phantom-label creation:
+        candidates are actual resting prices, while deltas may be half-ticks
+        when the BBO midpoint lies between market ticks.
+        """
+        bb, ba = sim.ob.get_bbo()
+        if bb is None or ba is None:
+            raise ValueError("cannot build legal candidates without a valid BBO")
+
+        native_to_pln = float(
+            getattr(sim, "price_native_to_pln", 1.0) or 1.0
+        )
+        bb_pln = float(bb) * native_to_pln
+        ba_pln = float(ba) * native_to_pln
+
+        from .phantom_labels import build_legal_tick_state
+
+        unused_depth = np.zeros(1, dtype=np.float64)
+        pg_b_pln, dg_b, _ = build_legal_tick_state(
+            bb_pln, ba_pln, unused_depth, unused_depth, 1,
+            tick_size=self.tick_size, delta_lo=self.delta_lo,
+            max_delta=self.max_delta,
+        )
+        pg_a_pln, dg_a, _ = build_legal_tick_state(
+            bb_pln, ba_pln, unused_depth, unused_depth, 2,
+            tick_size=self.tick_size, delta_lo=self.delta_lo,
+            max_delta=self.max_delta,
+        )
+        if dg_b.size == 0 or dg_a.size == 0:
+            raise ValueError(
+                "legal candidate grid is empty for "
+                f"BBO=({bb!r}, {ba!r}), delta bounds="
+                f"({self.delta_lo}, {self.max_delta})"
+            )
+
+        pg_b = pg_b_pln / native_to_pln
+        pg_a = pg_a_pln / native_to_pln
+        if bool(getattr(sim, "bbo_in_tick_index", False)):
+            pg_b = np.rint(pg_b)
+            pg_a = np.rint(pg_a)
+        return pg_b, dg_b, pg_a, dg_a
+
+    def _build_grids(self, z, sim=None):
         """(Re)tabulate per-side lambda grids from the active fill functions.
 
         Called once at construction in the state-independent (exponential)
         case, and once per quote when state-dependent hooks are in use.
         """
+        grid_b = grid_a = None
+        if self.candidate_grid == "legal":
+            if sim is None:
+                raise ValueError("legal candidate grids require the live simulator")
+            self._pg_b, grid_b, self._pg_a, grid_a = (
+                self._legal_candidate_grids(sim)
+            )
+            # Publish these before invoking h(z, delta): the exact queue-ahead
+            # path maps every assessed delta back to its executable price.
+            self._legal_dg_b = grid_b
+            self._legal_dg_a = grid_a
+
+        ergodic_solver = _get_ergodic_solver()
         if self._mode == "lam":
             self._dg_b, self._lg_b = ergodic_solver.precompute_lam_grid_discrete(
                 self._fn_b, z, self.solver_tick, self.max_delta,
-                delta_lo=self.delta_lo, lam_floor=0.0,
+                delta_lo=self.delta_lo, lam_floor=0.0, delta_grid=grid_b,
             )
             self._dg_a, self._lg_a = ergodic_solver.precompute_lam_grid_discrete(
                 self._fn_a, z, self.solver_tick, self.max_delta,
-                delta_lo=self.delta_lo, lam_floor=0.0,
+                delta_lo=self.delta_lo, lam_floor=0.0, delta_grid=grid_a,
             )
         else:
             self._dg_b, self._lg_b = ergodic_solver.precompute_lam_grid_discrete_from_h(
                 self._fn_b, z, self.poisson_tau, self.solver_tick, self.max_delta,
                 delta_lo=self.delta_lo, h_clamp=self.h_clamp,
+                delta_grid=grid_b,
             )
             self._dg_a, self._lg_a = ergodic_solver.precompute_lam_grid_discrete_from_h(
                 self._fn_a, z, self.poisson_tau, self.solver_tick, self.max_delta,
                 delta_lo=self.delta_lo, h_clamp=self.h_clamp,
+                delta_grid=grid_a,
             )
 
     def _update_vol(self, mid, t=None):
@@ -1285,8 +1355,10 @@ class NumericalErgodicMM:
         S = (-0.5 * self.gamma * float(sigma2) * qs * qs).astype(np.float64)
 
         if self.solver_engine == "hull":
+            ergodic_solver = _get_ergodic_solver()
             solver = ergodic_solver.solve_ergodic_discrete_hull
         else:
+            ergodic_solver = _get_ergodic_solver()
             solver = ergodic_solver.solve_ergodic_discrete
         t0 = time.perf_counter()
         phi, g, n_iter, converged, _last_dphi = solver(
@@ -1299,6 +1371,18 @@ class NumericalErgodicMM:
         self.total_iters += int(n_iter)
         self._phi = phi
         return g, n_iter, converged
+
+    @staticmethod
+    def _legal_price_for_delta(delta, delta_grid, price_grid):
+        """Return the executable price paired with a solver-selected delta."""
+        idx = int(np.argmin(np.abs(delta_grid - float(delta))))
+        if not math.isclose(
+            float(delta_grid[idx]), float(delta), rel_tol=0.0, abs_tol=1e-10,
+        ):
+            raise RuntimeError(
+                f"selected delta {delta!r} is absent from legal candidate grid"
+            )
+        return float(price_grid[idx]), idx
 
     def _compute_quotes(self, mid, sim, return_deltas=False):
         """Return ``(bid, ask, sigma_abs_pln, reservation_native)``.
@@ -1319,40 +1403,73 @@ class NumericalErgodicMM:
         if self._state_dependent and self._ewma_dt is not None and self._ewma_dt > 0:
             sigma2 = sigma2 / self._ewma_dt
 
-        # Refresh per-side lambda grids when the fill law depends on
-        # state (Hawkes intensity, book depth, ...).  State-independent
-        # mode skips this and reuses the cached grids.
-        if self._state_dependent:
+        # State-dependent fill laws are rebuilt every quote.  Legal grids are
+        # BBO-dependent, so they are also rebuilt even for a stationary law.
+        if self._state_dependent or self.candidate_grid == "legal":
             if self.state_extractor is not None:
                 z = self.state_extractor(sim)
             else:
                 z = sim
-            self._build_grids(z)
+            self._build_grids(z, sim=sim)
 
         # Solve / index the lattice in lots (1 lot = ``size`` shares).
         q_lots = self._inventory_lots()
         self._ensure_Q(abs(q_lots) + self.Q_margin)
         self._solve_phi(sigma2)
 
+        ergodic_solver = _get_ergodic_solver()
         delta_b, delta_a = ergodic_solver.optimal_deltas_discrete(
             q_lots, self._phi, self.gamma,
             self._lg_b, self._lg_a, self._dg_b, self._dg_a, self._Q,
         )
 
-        # Deltas are already on the tick grid in PLN.  Convert to native
-        # book prices and apply the same boundary safeguards as ErgodicMM.
-        raw_bid_pln = mid_pln - float(delta_b)
-        raw_ask_pln = mid_pln + float(delta_a)
-        raw_bid_n = raw_bid_pln / native_to_pln
-        raw_ask_n = raw_ask_pln / native_to_pln
+        if self.candidate_grid == "legal":
+            if q_lots >= self._Q:
+                bid = 0.0
+                bid_idx = None
+            else:
+                bid, bid_idx = self._legal_price_for_delta(
+                    delta_b, self._dg_b, self._pg_b,
+                )
+            if q_lots <= -self._Q:
+                ask = 0.0
+                ask_idx = None
+            else:
+                ask, ask_idx = self._legal_price_for_delta(
+                    delta_a, self._dg_a, self._pg_a,
+                )
 
-        if tick_idx:
-            bid = float(max(1.0, math.floor(raw_bid_n)))
-            ask = float(max(bid + 1.0, math.ceil(raw_ask_n)))
+            # With delta_lo <= 0 both sides can independently choose the
+            # midpoint tick. Keep the old ask-side tie-break, but move to the
+            # next *assessed legal candidate* instead of post-hoc rounding.
+            if bid > 0.0 and ask > 0.0 and ask <= bid:
+                valid_asks = np.flatnonzero(self._pg_a > bid)
+                if valid_asks.size:
+                    ask_idx = int(valid_asks[0])
+                    ask = float(self._pg_a[ask_idx])
+                    delta_a = float(self._dg_a[ask_idx])
+                else:
+                    valid_bids = np.flatnonzero(self._pg_b < ask)
+                    if not valid_bids.size:
+                        raise RuntimeError("legal bid/ask candidate grids cross")
+                    bid_idx = int(valid_bids[0])
+                    bid = float(self._pg_b[bid_idx])
+                    delta_b = float(self._dg_b[bid_idx])
         else:
-            ts = float(self.tick_size)
-            bid = round(max(ts, math.floor(raw_bid_n / ts) * ts), 8)
-            ask = round(max(bid + ts, math.ceil(raw_ask_n / ts) * ts), 8)
+            # Uniform deltas retain the historical midpoint inversion and
+            # floor/ceil executable-price snapping.
+            raw_bid_pln = mid_pln - float(delta_b)
+            raw_ask_pln = mid_pln + float(delta_a)
+            raw_bid_n = raw_bid_pln / native_to_pln
+            raw_ask_n = raw_ask_pln / native_to_pln
+
+            if tick_idx:
+                bid = float(max(1.0, math.floor(raw_bid_n)))
+                ask = float(max(bid + 1.0, math.ceil(raw_ask_n)))
+            else:
+                ts = float(self.tick_size)
+                bid = round(max(ts, math.floor(raw_bid_n / ts) * ts), 8)
+                ask = round(max(bid + ts, math.ceil(raw_ask_n / ts) * ts), 8)
 
         if return_deltas:
             return bid, ask, sigma_abs_pln, float(mid), float(delta_b), float(delta_a)

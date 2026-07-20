@@ -11,7 +11,9 @@ With full_extraction=True, also captures:
 - Aggregated aggressive-MO data
 """
 
+import json
 import sqlite3
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional, List
 
@@ -1133,6 +1135,15 @@ def run_full_extraction(
         Same-side depth levels per LO/CXL row in ``orders``
         (default matches ``data.schema.ORDERS_DEPTH_LEVELS``).
         Must match ``data/schema.py`` ``CREATE_ORDERS_TABLE``.
+
+    Returns
+    -------
+    dict
+        Aggregated statistics accumulated during extraction (event counts per
+        mark, Lee-Ready classification breakdown, raw fills and aggregated
+        market-order totals). The same summary is written next to the database
+        as ``<db_stem>_stats.json`` so it survives without re-reading the DB;
+        :func:`load_extraction_stats` reads it back.
     """
     if day_keys is None:
         day_keys = list_day_keys_hdf(orders_h5)
@@ -1150,6 +1161,14 @@ def run_full_extraction(
     cur.execute(CREATE_MO_ORDERS_TABLE)
     conn.commit()
 
+    # Accumulate the statistics extract_events_for_day already computes per day,
+    # so callers get them without re-querying the database afterwards.
+    event_marks = ["MO_bid", "MO_ask", "LO_bid", "LO_ask", "CXL_bid", "CXL_ask"]
+    event_counts = {m: 0 for m in event_marks}
+    agg_side_stats: dict = defaultdict(int)
+    total_n_fills = 0
+    total_n_mos = 0
+
     for day_key in day_keys:
         orders_df = load_orders_day(orders_h5, day_key)
         trades_df = load_trades_day(trades_h5, day_key, time_field)
@@ -1162,6 +1181,13 @@ def run_full_extraction(
             day_key=day_key,
             depth_levels=depth_levels,
         )
+
+        for mark in event_marks:
+            event_counts[mark] += len(events[mark])
+        for key, value in events["_side_stats"].items():
+            agg_side_stats[key] += int(value)
+        total_n_fills += int(events["_n_fills"])
+        total_n_mos += int(events["_n_mos"])
 
         lo_cxl_rows = events.pop("_lo_cxl_rows", [])
         mo_fills = events.pop("_mo_fills", [])
@@ -1205,4 +1231,44 @@ def run_full_extraction(
         conn.commit()
 
     conn.close()
+
+    classification = {rule: 0 for rule in ("quote", "midpoint", "tick", "last_side", "unclassified")}
+    for key in lee_ready_counter_keys:
+        classification[lee_ready_rule_map[key]] += agg_side_stats.get(key, 0)
+    classification["n_trades"] = agg_side_stats.get("n_trades", 0)
+
+    summary = {
+        "asset": asset,
+        "n_days": len(day_keys),
+        "event_counts": event_counts,
+        "n_fills": total_n_fills,
+        "n_mos": total_n_mos,
+        "classification": classification,
+    }
+
+    stats_path = extraction_stats_path(db_path)
+    with open(stats_path, "w") as f:
+        json.dump(summary, f, indent=2)
+
     print(f"Extraction complete: {Path(db_path).name} ({len(day_keys)} days)")
+    return summary
+
+
+def extraction_stats_path(db_path: Path) -> Path:
+    """Path of the statistics sidecar written alongside *db_path*."""
+    db_path = Path(db_path)
+    return db_path.with_name(f"{db_path.stem}_stats.json")
+
+
+def load_extraction_stats(db_path: Path) -> Optional[dict]:
+    """Load the extraction statistics summary written next to *db_path*.
+
+    Returns the summary produced by :func:`run_full_extraction`, or ``None`` if
+    no sidecar exists yet (i.e. the database was extracted before stats were
+    tracked; re-run extraction to generate it).
+    """
+    stats_path = extraction_stats_path(db_path)
+    if not stats_path.exists():
+        return None
+    with open(stats_path) as f:
+        return json.load(f)

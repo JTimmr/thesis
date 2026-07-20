@@ -3,8 +3,7 @@
 The production model is the single-exponential multivariate Hawkes process.
 Each kernel is ``φ_ij(t) = α_ij β_ij exp(−β_ij t)``, fitted by maximum
 likelihood: Optuna searches the decay rates ``β_ij`` and the ``tick`` learner
-returns the baseline ``μ`` and adjacency ``α``. The same code path fits the
-Poisson baseline and the per-dimension univariate Hawkes used as sanity checks.
+returns the baseline ``μ`` and adjacency ``α``.
 
 Calibration runs in two time domains. Raw clock time is the default. The other
 is seasonality-adjusted ``τ``-time, where a shared intraday profile is
@@ -26,7 +25,7 @@ import pickle
 import time
 from functools import partial
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -36,6 +35,7 @@ from scipy import stats
 import optuna
 from tick.hawkes import HawkesExpKern
 
+from research_core.classes.helpers import resolve_data_path
 from research_core.classes.parallelisation import run_parallel_optuna
 
 
@@ -88,60 +88,7 @@ def clock_to_tau(t, *, grid: np.ndarray, cumulative_integral: np.ndarray) -> np.
     return np.interp(t, grid, cumulative_integral)
 
 
-def format_mean_with_ci(values, decimal_format: str = ".6f") -> str:
-    """Format a sample mean with its 95% t-distribution confidence interval.
-
-    Example output: '0.123456  95% CI [0.120000, 0.126912] (+/-2.4%)'
-    Returns just the mean if fewer than 2 finite values are available.
-    """
-    values = np.asarray(values, dtype=float)
-    values = values[np.isfinite(values)]
-    n = len(values)
-
-    if n == 0:
-        return f"{np.nan:{decimal_format}}"
-    mean_value = values.mean()
-    if n < 2:
-        return f"{mean_value:{decimal_format}}"
-
-    standard_error = values.std(ddof=1) / np.sqrt(n)
-    t_critical = stats.t.ppf(0.975, df=n - 1)
-    ci_half_width = t_critical * standard_error
-    lower = mean_value - ci_half_width
-    upper = mean_value + ci_half_width
-
-    if mean_value != 0:
-        relative_pct = ci_half_width / abs(mean_value) * 100
-    else:
-        relative_pct = float("inf")
-
-    return f"{mean_value:{decimal_format}}  95% CI [{lower:{decimal_format}}, {upper:{decimal_format}}] (+/-{relative_pct:.1f}%)"
-
-
 # --- Optuna objectives ---
-
-class UnivariateHawkesObjective:
-    """Optuna objective for univariate (self-exciting) Hawkes calibration."""
-
-    def __init__(self, beta_min, beta_max, max_iter, tol, events, end_times):
-        self.beta_min = beta_min
-        self.beta_max = beta_max
-        self.max_iter = max_iter
-        self.tol = tol
-        self.events = events
-        self.end_times = end_times
-
-    def __call__(self, trial):
-        beta = trial.suggest_float("beta", self.beta_min, self.beta_max, log=True)
-        decays = np.array([[beta]])
-        model = HawkesExpKern(decays=decays, max_iter=self.max_iter, tol=self.tol)
-        model.fit(self.events)
-        alpha = float(model.adjacency[0, 0])
-        if alpha >= 1.0:
-            return -np.inf
-        score = model.score(events=self.events, end_times=self.end_times)
-        return float(score)
-
 
 class MultivariateHawkesObjective:
     """Optuna objective for multivariate Hawkes calibration (single-exp)."""
@@ -595,218 +542,7 @@ class HawkesCalibration:
             if len(compensator_all) > 0:
                 plot_time_rescaling_cdf(compensator_all, f"{label}: {dim_name}")
 
-    # --- 1. Poisson calibration ---
-
-    def fit_poisson(self, day_keys: List[str], use_tau: bool = False, gof_dims: List[str] = []) -> dict:
-        """Fit independent homogeneous Poisson processes.
-
-        Parameters
-        ----------
-        use_tau : bool
-            If True, use seasonality-adjusted τ-time.
-        day_keys : list[str]
-            Labels for each day (for per-day reporting).
-        gof_dims : list[str]
-            Dimensions for which GOF plots are produced.
-
-        Returns
-        -------
-        dict with keys:
-            pooled_df    : pd.DataFrame with pooled MLE results
-            daily_df     : pd.DataFrame with per-day MLE results
-            total_ll     : float, total log-likelihood
-            per_event_ll : float, per-event log-likelihood
-        """
-        events, end_times = self.resolve_events(use_tau)
-
-        if len(end_times):
-            T_total = float(np.sum(end_times))
-        else:
-            T_total = 0.0
-
-        counts = np.array([
-            sum(len(day_seq[k]) for day_seq in events)
-            for k in range(self.n_nodes)
-        ], dtype=float)
-
-        if T_total > 0:
-            mu = counts / T_total
-        else:
-            mu = np.zeros_like(counts)
-        se_mu = np.sqrt(mu / T_total)
-        mu_ci_lo = mu - 1.96 * se_mu
-        mu_ci_hi = mu + 1.96 * se_mu
-
-        ll = np.where(mu > 0, counts * np.log(mu) - mu * T_total, -np.inf)
-        per_ev = np.where(counts > 0, ll / counts, np.nan)
-
-        pooled_df = pd.DataFrame({
-            "dim": self.marks_order,
-            "mu": mu,
-            "mu_ci_lower": mu_ci_lo,
-            "mu_ci_upper": mu_ci_hi,
-            "n_events": counts.astype(int),
-            "log_likelihood": ll,
-            "per_event": per_ev,
-        })
-
-        total_ll = float(np.nansum(ll))
-        total_n = int(np.nansum(counts))
-        if total_n:
-            per_event_ll = total_ll / total_n
-        else:
-            per_event_ll = np.nan
-
-        if use_tau:
-            label = "τ-time"
-        else:
-            label = "raw"
-
-        if gof_dims:
-            dummy_adj = np.zeros((self.n_nodes, self.n_nodes))
-            dummy_decays = np.ones((self.n_nodes, self.n_nodes))
-            self._plot_gof_for_dims(
-                gof_dims, events, dummy_adj, mu, dummy_decays,
-                f"Poisson ({label})",
-            )
-
-        daily_rows = []
-        for d, (dk, day_seq) in enumerate(zip(day_keys, events)):
-            T_day = float(end_times[d])
-            for k, dim_name in enumerate(self.marks_order):
-                n_ev = len(day_seq[k])
-                if T_day > 0:
-                    mu_day = n_ev / T_day
-                else:
-                    mu_day = 0.0
-                if mu_day > 0 and n_ev > 0:
-                    ll_day = n_ev * np.log(mu_day) - mu_day * T_day
-                else:
-                    ll_day = np.nan
-                if n_ev > 0:
-                    per_event_day = ll_day / n_ev
-                else:
-                    per_event_day = np.nan
-                daily_rows.append({
-                    "day": dk, "dim": dim_name, "mu": mu_day,
-                    "n_events": n_ev, "T_day": T_day,
-                    "log_likelihood": ll_day,
-                    "per_event": per_event_day,
-                })
-        daily_df = pd.DataFrame(daily_rows)
-
-        per_day_summary = daily_df.groupby("day").agg(
-            total_ll=("log_likelihood", "sum"),
-            total_n=("n_events", "sum"),
-        ).reset_index()
-        per_day_summary["per_event"] = (
-            per_day_summary["total_ll"] / per_day_summary["total_n"]
-        )
-
-        print(f"\n-- Poisson per-day calibration ({label}, mean +/- 95% CI) --")
-        for dim_name in self.marks_order:
-            mu_values = daily_df[daily_df["dim"] == dim_name]["mu"].values
-            print(f"  {dim_name:8s}  mu = {format_mean_with_ci(mu_values)}")
-        print(
-            "\n  Per-event (per-day MLE): "
-            f"{format_mean_with_ci(per_day_summary['per_event'].values)}"
-        )
-
-        return {
-            "pooled_df": pooled_df,
-            "daily_df": daily_df,
-            "total_ll": total_ll,
-            "per_event_ll": per_event_ll,
-        }
-
-    # --- 2. Univariate Hawkes: single exponential ---
-
-    def fit_univariate_hawkes(self, use_tau: bool = False, n_trials: int = 100, beta_min: float = 0.01, beta_max: float = 20.0, gof_dims: List[str] = []) -> dict:
-        """Fit independent univariate Hawkes per dimension (single-exp kernel).
-
-        Returns dict with keys:
-            df       : pd.DataFrame with per-dimension results
-            models   : dict[dim_name -> fitted HawkesExpKern]
-            total_ll, per_event_ll : floats
-        """
-        events, end_times = self.resolve_events(use_tau)
-
-        if use_tau:
-            label = "τ-time"
-        else:
-            label = "raw"
-        results = []
-        models: Dict[str, object] = {}
-
-        for k, dim_name in enumerate(self.marks_order):
-            realizations = [day_seq[k] for day_seq in events]
-            total_ev = sum(len(s) for s in realizations)
-            if total_ev == 0:
-                continue
-
-            if use_tau:
-                ev_list = [[seq] for seq in realizations]
-                dim_end = end_times
-            else:
-                filtered = [s for s in realizations if len(s)]
-                ev_list = [[s] for s in filtered]
-                dim_end = np.array([float(s[0].max()) for s in ev_list])
-
-            study = optuna.create_study(direction="maximize")
-            objective = UnivariateHawkesObjective(
-                beta_min, beta_max, self.max_iter, self.tol, ev_list, dim_end,
-            )
-            study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
-
-            best_beta = study.best_params["beta"]
-
-            best_model = HawkesExpKern(
-                decays=np.array([[best_beta]]),
-                max_iter=self.max_iter, tol=self.tol,
-            )
-            best_model.fit(ev_list)
-            models[dim_name] = best_model
-
-            alpha_hat = float(best_model.adjacency[0, 0])
-            mu_hat = float(best_model.baseline[0])
-            ll = float(best_model.score(events=ev_list, end_times=dim_end))
-
-            results.append({
-                "dim": dim_name, "beta": best_beta, "alpha": alpha_hat,
-                "mu": mu_hat, "score": ll, "n_events": total_ev,
-                "stable_alpha_lt_1": alpha_hat < 1.0,
-            })
-
-        df = pd.DataFrame(results)
-
-        total_ll = float((df["score"] * df["n_events"]).sum())
-        total_n = int(df["n_events"].sum())
-        per_event_ll = total_ll / total_n
-
-        if gof_dims:
-            valid_gof_dims = [dim_name for dim_name in gof_dims if dim_name in models]
-            if valid_gof_dims:
-                full_adjacency = np.zeros((self.n_nodes, self.n_nodes))
-                full_decays = np.ones((self.n_nodes, self.n_nodes))
-                full_baseline = np.zeros(self.n_nodes)
-                for fitted_name, model in models.items():
-                    dim_idx = self.marks_order.index(fitted_name)
-                    full_adjacency[dim_idx, dim_idx] = float(model.adjacency[0, 0])
-                    full_decays[dim_idx, dim_idx] = float(model.decays[0, 0])
-                    full_baseline[dim_idx] = float(model.baseline[0])
-                self._plot_gof_for_dims(
-                    valid_gof_dims, events, full_adjacency, full_baseline,
-                    full_decays, f"Self-exciting ({label})",
-                )
-
-        return {
-            "df": df,
-            "models": models,
-            "total_ll": total_ll,
-            "per_event_ll": per_event_ll,
-        }
-
-    # --- 3. Multivariate Hawkes: single exponential ---
+    # --- 1. Multivariate Hawkes: single exponential ---
 
     def fit_multivariate_hawkes(self, use_tau: bool = False, n_trials: int = 1000, n_workers: int = 12, beta_min: float = 0.1, beta_max: float = 20.0, gof_dims: List[str] = []) -> dict:
         """Fit the multivariate single-exponential Hawkes process.
@@ -910,7 +646,7 @@ class HawkesCalibration:
             "model": model,
         }
 
-    # --- 4. Goodness-of-fit (single-exponential, any dimension) ---
+    # --- 2. Goodness-of-fit (single-exponential, any dimension) ---
 
     def goodness_of_fit(self, dim_name: str, adjacency: np.ndarray, baseline: np.ndarray, decays: np.ndarray, use_tau: bool = False, title: Optional[str] = None):
         """Plot the time-rescaling GOF for one dimension of a single-exp fit.
@@ -967,18 +703,29 @@ class HawkesCalibration:
             plot_time_rescaling_cdf(compensator_all, title)
         return compensator_all
 
-    # --- 5. Save / load calibration results ---
+    # --- 3. Save / load calibration results ---
 
     @staticmethod
     def save_params(path: Union[str, Path], **kwargs):
-        """Pickle calibration results to *path*."""
-        path = Path(path)
+        """Pickle calibration results into the data directory.
+
+        A bare filename (or any relative path) is resolved under ``data/`` via
+        :func:`resolve_data_path`, so calibration artefacts always land in the
+        canonical location regardless of the notebook's working directory.
+        Absolute paths are written unchanged.
+        """
+        path = resolve_data_path(path)
         with open(path, "wb") as f:
             pickle.dump(kwargs, f)
-        print(f"Saved: {Path(path).name}")
+        print(f"Saved: {path}")
 
     @staticmethod
     def load_params(path: Union[str, Path]) -> dict:
-        """Load pickled calibration results."""
+        """Load pickled calibration results from the data directory.
+
+        Mirrors :meth:`save_params`: relative paths resolve under ``data/`` and
+        absolute paths are read unchanged.
+        """
+        path = resolve_data_path(path)
         with open(path, "rb") as f:
             return pickle.load(f)

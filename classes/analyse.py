@@ -425,7 +425,7 @@ class AnalyseMarket:
         n_show = min(40, len(counts))
         ax.plot(counts.index[1:n_show], counts.values[1:n_show], marker="o")
         ax.set_xlabel("Spread (ticks)"); ax.set_ylabel("Count")
-        ax.set_title("Spread frequency (first ticks)")
+        ax.set_title("Spread frequency (first 40 ticks)")
 
         plt.tight_layout(); plt.show()
         print(f"Modal spread (ticks): {counts.idxmax()}")
@@ -475,10 +475,10 @@ class AnalyseMarket:
 
         plt.tight_layout(); plt.show()
 
-    # --- Inside-Spread Placement ---
+    # --- In-Spread Placement ---
     def inside_spread_placement(self, max_spread=20):
         """
-        Inside-spread conditional PMF with linear-fit parameter *c*.
+        In-spread conditional PMF with linear-fit parameter *c*.
 
         Returns dict  ``{regime_label: c_value}``.
         """
@@ -501,8 +501,8 @@ class AnalyseMarket:
         inside_mask = (tfb < 0) & (tfb > -spread)
         p_best = (tfb == 0).mean()
         p_passive = (tfb > 0).mean()
-        print(f"P(best): {p_best:.4f}  |  P(passive): {p_passive:.4f}")
-        print(f"Inside-spread orders: {inside_mask.sum():,} "
+        print(f"P(best): {p_best:.4f}  |  P(deep): {p_passive:.4f}")
+        print(f"In-spread orders: {inside_mask.sum():,} "
               f"({inside_mask.mean():.4f})")
 
         in_mask = inside_mask & (spread <= max_spread)
@@ -599,9 +599,126 @@ class AnalyseMarket:
 
         return regime_results
 
+    def inside_spread_pmf_by_spread(self, max_spread=20, min_count=30,
+                                     show_pooled=False):
+        r"""In-spread placement location, pooled into spread regimes.
+
+        Rather than one line per raw spread value $S\in\{2,\ldots,
+        \text{max\_spread}\}$, observations are pooled into three regimes
+        (mirroring the passive-depth spread-regime figure): narrow
+        ($S\in\{2,3,4\}$), medium ($S\in\{5,\ldots,8\}$) and wide
+        ($9\leq S\leq\text{max\_spread}$).
+        Within each regime the absolute placement
+        $x\in\{1,\ldots,S-1\}$ ticks from the own-side best is retained.
+        Observations are pooled before computing the regime-conditional PMF.
+        Locations backed by fewer than ``min_count`` raw observations are
+        dropped rather than plotted. The pooled reference is optional because
+        the narrow regime dominates the sample and can obscure the regime
+        comparison.
+
+        Also prints (and returns) three dense arrays ``p[x]`` for
+        ``x=1..S_max-1``, one per regime, for table-lookup sampling:
+        at runtime renormalize over legal ``x∈{1..S-1}``, then
+        ``np.random.choice``.
+        """
+        max_spread = int(max_spread)
+        if max_spread < 9:
+            raise ValueError("max_spread must be at least 9")
+        if min_count < 1:
+            raise ValueError("min_count must be positive")
+
+        conn = self._conn()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT spread_ticks, ticks_from_best FROM orders "
+            "WHERE event_type = 'LO' AND spread_ticks IS NOT NULL "
+            "  AND ticks_from_best IS NOT NULL"
+            + self._day_clause()
+        )
+        rows = cur.fetchall()
+        conn.close()
+
+        spread = np.array([r[0] for r in rows], dtype=np.float64)
+        tfb = np.array([r[1] for r in rows], dtype=np.float64)
+        inside_mask = (tfb < 0) & (tfb > -spread)
+        x_all = -tfb[inside_mask]
+        s_all = spread[inside_mask]
+
+        regimes = {
+            "Narrow ($2\\leq S\\leq4$)": [2, 3, 4],
+            "Medium ($5\\leq S\\leq8$)": [5, 6, 7, 8],
+            "Wide ($S\\geq 9$)": list(range(9, max_spread + 1)),
+        }
+        regime_keys = ("narrow", "medium", "wide")
+        displayed_spreads = np.arange(2, max_spread + 1)
+
+        def _pooled_pmf(spreads):
+            m = np.isin(s_all, spreads)
+            if not m.any():
+                return np.array([]), np.array([])
+            x, counts = np.unique(x_all[m].astype(np.int64),
+                                  return_counts=True)
+            pr = counts / counts.sum()
+            keep = counts >= min_count
+            return x[keep], pr[keep]
+
+        def _dense_pmf(spreads):
+            """Empirical p[x] on x=1..S_max-1 (index 0 -> x=1)."""
+            p = np.zeros(max_spread - 1, dtype=np.float64)
+            m = np.isin(s_all, spreads)
+            if not m.any():
+                return p
+            x = x_all[m].astype(np.int64)
+            valid = (x >= 1) & (x <= max_spread - 1)
+            x = x[valid]
+            if x.size == 0:
+                return p
+            counts = np.bincount(x, minlength=max_spread)[1:max_spread]
+            total = counts.sum()
+            if total > 0:
+                p = counts / total
+            return p
+
+        # Table-lookup arrays: save three p[x] for x=1..S_max-1
+        pmfs = {}
+        print(
+            f"Table-lookup PMFs p[x] for x=1..{max_spread - 1} "
+            f"(renormalize over legal x∈{{1..S-1}} at runtime, "
+            f"then np.random.choice):"
+        )
+        for key, (label, spreads) in zip(regime_keys, regimes.items()):
+            p = _dense_pmf(spreads)
+            pmfs[key] = p
+            n = int(np.isin(s_all, spreads).sum())
+            print(f"  {key} (n={n:,}):")
+            print(f"    p = {np.array2string(p, precision=6, separator=', ')}")
+
+        colors = plt.cm.viridis(np.linspace(0.15, 0.85, len(regimes)))
+
+        fig, ax = plt.subplots(figsize=(6, 4.5))
+        if show_pooled:
+            x_pool, p_pool = _pooled_pmf(displayed_spreads)
+            ax.plot(x_pool, p_pool, "--", color="0.4", lw=2.5,
+                    label="All spreads pooled", zorder=1)
+        for (label, spreads), color in zip(regimes.items(), colors):
+            x, pr = _pooled_pmf(spreads)
+            ax.plot(x, pr, marker="o", ms=4, color=color,
+                    label=label, zorder=2)
+
+        ax.set_yscale("log")
+        ax.set_xlim(0.5, max_spread - 0.5)
+        tick_step = max(1, int(np.ceil((max_spread - 1) / 10)))
+        ax.set_xticks(np.arange(1, max_spread, tick_step))
+        ax.set_xlabel(r"Tick distance from same-side best $x$ (ticks)")
+        ax.set_ylabel(r"$\Pr(x \mid S)$")
+        ax.set_title("In-spread placement location by spread regime")
+        ax.legend(fontsize=8, loc="upper right")
+        plt.tight_layout(); plt.show()
+        return pmfs
+
     # --- Probability vs Spread ---
     def probability_vs_spread(self, max_spread=None):
-        """P(best|s), P(inside|s), P(passive|s) vs spread.
+        """P(best|S), P(in|S), P(deep|S) vs spread.
 
         Sign convention (see ``extract.py``): ``ticks_from_best`` is measured
         from the *own-side* best, positive pointing away from the mid.  So
@@ -643,10 +760,10 @@ class AnalyseMarket:
                 p_passive.append(n_passive / n)
 
         plt.figure(figsize=(8, 6))
-        plt.plot(spread_values, p_best, marker="o", label="P(best | s)")
-        plt.plot(spread_values, p_inside, marker="o", label="P(inside | s)")
-        plt.plot(spread_values, p_passive, marker="o", label="P(passive | s)")
-        plt.xlabel("Spread (ticks)"); plt.ylabel("Probability")
+        plt.plot(spread_values, p_best, marker="o", label="P(best | S)")
+        plt.plot(spread_values, p_inside, marker="o", label="P(in | S)")
+        plt.plot(spread_values, p_passive, marker="o", label="P(deep | S)")
+        plt.xlabel("Spread  $S$  (ticks)"); plt.ylabel("Probability")
         plt.title("Order placement regime vs spread")
         plt.legend(); plt.tight_layout(); plt.show()
 
@@ -654,7 +771,7 @@ class AnalyseMarket:
 
     def piecewise_inside_fit(self, spread_values=None,
                              p_inside_values=None, max_spread=20):
-        """Piecewise linear fit of P(inside | s)."""
+        """Piecewise linear fit of P(in | s)."""
         if spread_values is None or p_inside_values is None:
             spread_values, _, p_inside_values, _ = self.probability_vs_spread()
 
@@ -675,7 +792,7 @@ class AnalyseMarket:
         plt.plot(s1, c1[0] * s1 + c1[1], lw=2, label="Regime 1 (2–9)")
         s2 = np.linspace(9, max_spread, 100)
         plt.plot(s2, c2[0] * s2 + c2[1], lw=2, label=f"Regime 2 (9–{max_spread})")
-        plt.xlabel("Spread (ticks)"); plt.ylabel("P(inside | s)")
+        plt.xlabel("Spread (ticks)"); plt.ylabel("P(in | s)")
         plt.legend(); plt.tight_layout(); plt.show()
 
         print(f"Regime 1 (2–9):   slope={c1[0]:.6f}, intercept={c1[1]:.6f}")
@@ -742,15 +859,16 @@ class AnalyseMarket:
 
         plt.figure(figsize=(8, 6))
         plt.scatter(x, y, s=8, label="Empirical")
-        plt.plot(x_fit, y_fit, lw=2, label=f"Power-law (β = {beta:.3f})")
+        plt.plot(x_fit, y_fit, lw=2,
+                 label=rf"Power-law fit ($\hat\beta_D$ = {beta:.3f})")
         plt.xscale("log"); plt.yscale("log")
-        plt.xlabel("Passive depth (ticks beyond spread)")
+        plt.xlabel(r"Distance $\Delta$ (ticks beyond same-side best quote)")
         plt.ylabel("Density")
-        plt.title("Passive depth PMF with power-law fit")
+        plt.title("Passive-placement distance PMF with power-law fit")
         plt.legend(); plt.tight_layout(); plt.show()
 
         print(f"Total passive orders: {len(depth):,}")
-        print(f"β = {beta:.4f},  R² = {r2:.4f}")
+        print(f"β_D = {beta:.4f},  R² = {r2:.4f}")
         return beta, r2
 
     def passive_depth_by_side(self, num_bins=80):
@@ -779,12 +897,13 @@ class AnalyseMarket:
             plt.plot(xf, 10 ** intercept * xf ** slope, lw=2)
 
         plt.xscale("log"); plt.yscale("log")
-        plt.xlabel("Passive depth (ticks)"); plt.ylabel("Density")
-        plt.title("Passive depth: Bid vs Ask")
+        plt.xlabel(r"Distance $\Delta$ (ticks beyond same-side best quote)")
+        plt.ylabel("Density")
+        plt.title("Passive-placement distance PDF (log-binned): Bid vs Ask")
         plt.legend(); plt.tight_layout(); plt.show()
 
         for label, beta, r2 in results:
-            print(f"{label}: β = {beta:.4f},  R² = {r2:.4f}")
+            print(f"{label}: β_D = {beta:.4f},  R² = {r2:.4f}")
 
     def passive_depth_by_spread(self, num_bins=80):
         """Passive depth by spread regime."""
@@ -813,17 +932,27 @@ class AnalyseMarket:
             beta, _, slope, intercept = self._power_law_fit(x, y)
             xf = np.logspace(np.log10(x.min()), np.log10(x.max()), 200)
             plt.plot(xf, 10 ** intercept * xf ** slope, lw=2)
-            print(f"{label}: β = {beta:.4f}")
+            print(f"{label}: β_D = {beta:.4f}")
 
         plt.xscale("log"); plt.yscale("log")
-        plt.xlabel("Passive depth (ticks)"); plt.ylabel("Density")
-        plt.title("Passive depth by spread regime")
+        plt.xlabel(r"Distance $\Delta$ (ticks beyond same-side best quote)")
+        plt.ylabel("Density")
+        plt.title("Passive-placement distance PMF (log-binned) with power-law fits")
         plt.legend(); plt.tight_layout(); plt.show()
 
-    def passive_depth_by_imbalance(self, num_bins=80):
-        """Passive depth by order-book imbalance × side."""
+    def passive_depth_by_imbalance(self, num_bins=80, side=None):
+        """Passive depth by order-book imbalance × side.
+
+        Parameters
+        ----------
+        side : {None, 1, 2, "bid", "ask"}
+            If set, plot only bid (1) or ask (2) orders; otherwise both.
+        """
         df = self._load_passive_depth()
         df = df[df["depth"] > 0]
+        if df.empty:
+            print("No passive limit orders with positive depth found.")
+            return []
 
         imb_regimes = {
             "Ask heavy (I < -0.3)": df["imbalance"] < -0.3,
@@ -836,8 +965,27 @@ class AnalyseMarket:
                            np.log10(df["depth"].max()), num_bins)
         results = []
 
-        for side_val, side_name in [(1, "Bid orders"), (2, "Ask orders")]:
+        if side is None:
+            side_items = [(1, "Bid orders"), (2, "Ask orders")]
+        else:
+            if isinstance(side, str):
+                side_key = side.lower()
+                if side_key in ("bid", "buy", "b"):
+                    side_val = 1
+                elif side_key in ("ask", "sell", "a"):
+                    side_val = 2
+                else:
+                    raise ValueError("side must be one of: bid, ask, 1, 2")
+            elif side in (1, 2):
+                side_val = side
+            else:
+                raise ValueError("side must be one of: bid, ask, 1, 2")
+            side_name = "Bid orders" if side_val == 1 else "Ask orders"
+            side_items = [(side_val, side_name)]
+
+        for side_val, side_name in side_items:
             plt.figure(figsize=(9, 6))
+            plotted = False
             for label, mask in imb_regimes.items():
                 d = df.loc[mask & (df["side"] == side_val), "depth"]
                 if len(d) < 100:
@@ -847,19 +995,30 @@ class AnalyseMarket:
                 m = hist > 0
                 x, y = centers[m], hist[m]
                 plt.scatter(x, y, s=10, label=f"{label} (n={len(d):,})")
+                plotted = True
 
-                beta, r2, slope, intercept = self._power_law_fit(x, y)
-                results.append((side_name, label, beta, r2))
-                xf = np.logspace(np.log10(x.min()), np.log10(x.max()), 200)
-                plt.plot(xf, 10 ** intercept * xf ** slope, lw=2)
+                if len(x) >= 2:
+                    beta, r2, slope, intercept = self._power_law_fit(x, y)
+                    results.append((side_name, label, beta, r2))
+                    xf = np.logspace(np.log10(x.min()), np.log10(x.max()), 200)
+                    plt.plot(xf, 10 ** intercept * xf ** slope, lw=2)
 
             plt.xscale("log"); plt.yscale("log")
-            plt.xlabel("Passive depth (ticks)"); plt.ylabel("Density")
-            plt.title(f"Passive depth – {side_name}")
-            plt.legend(); plt.tight_layout(); plt.show()
+            plt.xlabel(r"Distance $\Delta$ (ticks beyond same-side best quote)")
+            plt.ylabel("Density")
+            plt.title(f"Passive-placement distance PDF (log-binned) - {side_name}")
+            if plotted:
+                plt.legend()
+            else:
+                plt.text(0.5, 0.5, "No regime has enough observations",
+                         transform=plt.gca().transAxes, ha="center",
+                         va="center")
+                print(f"{side_name}: no imbalance regime has ≥100 observations.")
+            plt.tight_layout(); plt.show()
 
         for s, r, b, r2 in results:
-            print(f"{s} | {r}: β = {b:.4f},  R² = {r2:.4f}")
+            print(f"{s} | {r}: β_D = {b:.4f},  R² = {r2:.4f}")
+        return results
 
     # --- Queue Position ---
     def queue_at_bbo(self, bins=150):
@@ -894,7 +1053,12 @@ class AnalyseMarket:
         print(f"Mean: {mean_qa:.1f},  Median: {median_qa:.1f}")
 
     def queue_passive(self, bins=60):
-        """Queue position for passive orders with power-law tail fit."""
+        """Queue position for passive orders with power-law tail fit.
+
+        Fits a Pareto tail with exponent :math:`\\hat\\kappa_q` starting at
+        :math:`\\hat q_0` (90th-percentile cutoff).  Returns
+        ``(kappa_q, q_0)`` — the fitted exponent and cutoff queue size.
+        """
         conn = self._conn()
         cur = conn.cursor()
         cur.execute(
@@ -910,10 +1074,17 @@ class AnalyseMarket:
 
         vals = np.array([r[0] for r in rows], dtype=np.float64)
         cnts = np.array([r[1] for r in rows], dtype=np.float64)
+        if len(vals) == 0:
+            print("No passive limit orders with positive queue_ahead found.")
+            return None
 
         # Expand grouped counts into log-binned histogram
-        log_bins = np.logspace(np.log10(vals.min()),
-                               np.log10(vals.max()), bins)
+        bins = max(2, int(bins))
+        if vals.min() == vals.max():
+            log_bins = np.array([vals.min(), vals.max() + 1.0])
+        else:
+            log_bins = np.logspace(np.log10(vals.min()),
+                                   np.log10(vals.max()), bins)
         hist = np.zeros(len(log_bins) - 1)
         bin_idx = np.searchsorted(log_bins, vals, side="right") - 1
         bin_idx = np.clip(bin_idx, 0, len(hist) - 1)
@@ -923,6 +1094,8 @@ class AnalyseMarket:
         widths = np.diff(log_bins)
         hist = hist / (total * widths)
         centers = np.sqrt(log_bins[:-1] * log_bins[1:])
+        m = hist > 0
+        centers, hist = centers[m], hist[m]
 
         # Percentile-based tail fit from grouped data
         cs = np.cumsum(cnts)
@@ -932,29 +1105,54 @@ class AnalyseMarket:
         tail_vals = vals[tail_mask]
         tail_cnts = cnts[tail_mask]
         n_tail = tail_cnts.sum()
+        tail_mass = n_tail / total
         log_sum = np.sum(tail_cnts * np.log(tail_vals / xmin))
         if log_sum > 0:
             alpha = 1 + n_tail / log_sum
         else:
             alpha = 2.0
 
-        plt.figure(figsize=(6, 4))
-        m = hist > 0
-        plt.loglog(centers[m], hist[m], "o", label="Empirical")
-        x_fit = np.linspace(xmin, x.max(), 200)
-        y_fit = (alpha - 1) / xmin * (x_fit / xmin) ** (-alpha)
-        plt.loglog(x_fit, y_fit, "--",
-                   label=f"Power law α ≈ {alpha:.2f}")
-        plt.xlabel("Queue ahead"); plt.ylabel("Density")
-        plt.title("Passive queue position")
-        plt.legend(); plt.grid(True, alpha=0.3); plt.show()
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.loglog(centers, hist, "o", label="Empirical")
+        xmax = float(vals.max())
+        if xmax > xmin:
+            x_fit = np.logspace(np.log10(xmin), np.log10(xmax), 200)
+            # The empirical histogram is normalized over the full sample,
+            # whereas the Pareto density is conditional on q >= xmin.
+            # Scale by the observed tail mass so both use the same density.
+            y_fit = (tail_mass * (alpha - 1) / xmin
+                     * (x_fit / xmin) ** (-alpha))
+            ax.loglog(
+                x_fit, y_fit, "--",
+                label=rf"Power-law fit ($\hat\kappa_q \approx {alpha:.2f}$)"
+            )
+            ax.axvline(
+                xmin, color="0.35", ls=":", lw=1.5,
+                label=rf"Fit starts at $\hat q_0={xmin:,.0f}$"
+            )
+        ax.set_xlabel("Queue size  $q$  (shares)"); ax.set_ylabel("Density")
+        ax.set_title("Passive Queue Position Density"); ax.legend()
+        fig.tight_layout()
+        plt.show()
 
-        print(f"Estimated α = {alpha:.3f},  xmin = {xmin:.0f}")
+        print(
+            f"kappa_q = {alpha:.3f}  "
+            f"(q\u0302_0 = {xmin:.0f}, tail mass = {tail_mass:.1%})"
+        )
+        return alpha, xmin
 
     # --- Order Size Distributions ---
-    def _plot_size_density(self, shares, title, n_bins,
+    def _plot_size_density(self, shares, title, symbol, n_bins,
                            mid_range, tail_start):
-        """Internal: log-binned size density with two-regime fit."""
+        """Internal: log-binned size density with two-regime fit.
+
+        Parameters
+        ----------
+        symbol : str
+            Subscript used for the fitted exponents in the legend/print
+            output, e.g. ``"LO"`` or ``"MO"`` (matches the thesis symbols
+            $\\hat\\eta_{\\mathrm{LO},1/2}$ / $\\hat\\eta_{\\mathrm{MO},1/2}$).
+        """
         shares = shares[np.isfinite(shares) & (shares > 0)]
         bins = np.logspace(np.log10(shares.min()),
                            np.log10(shares.max()), n_bins)
@@ -970,22 +1168,23 @@ class AnalyseMarket:
 
         flat_slope, flat_int, *_ = linregress(logx[mid_m], logy[mid_m])
         tail_slope, tail_int, *_ = linregress(logx[tail_m], logy[tail_m])
+        eta1, eta2 = -flat_slope, -tail_slope
 
         plt.figure(figsize=(7, 5))
         plt.loglog(centers, hist, "o", label="Empirical")
 
         xf = np.linspace(logx[mid_m].min(), logx[mid_m].max(), 100)
         plt.loglog(10 ** xf, 10 ** (flat_slope * xf + flat_int), "--",
-                   label=f"Mid slope = {flat_slope:.2f}")
+                   label=rf"$\hat\eta_{{\mathrm{{{symbol}}},1}}$ = {eta1:.3f}")
         xf = np.linspace(logx[tail_m].min(), logx[tail_m].max(), 100)
         plt.loglog(10 ** xf, 10 ** (tail_slope * xf + tail_int), "--",
-                   label=f"Tail slope = {tail_slope:.2f}")
-        plt.xlabel("Size"); plt.ylabel("Density")
+                   label=rf"$\hat\eta_{{\mathrm{{{symbol}}},2}}$ = {eta2:.3f}")
+        plt.xlabel("Size (shares)"); plt.ylabel("Density")
         plt.title(f"{title} Size Density"); plt.legend()
         plt.show()
 
-        print(f"Mid slope  ≈ {flat_slope:.3f}")
-        print(f"Tail slope ≈ {tail_slope:.3f}  (α ≈ {-tail_slope:.3f})")
+        print(f"\u03b7\u0302_{symbol},1 \u2248 {eta1:.3f}")
+        print(f"\u03b7\u0302_{symbol},2 \u2248 {eta2:.3f}")
 
     def lo_size_distribution(self, n_log_bins=35):
         """Limit-order size density with two-regime fit."""
@@ -998,7 +1197,7 @@ class AnalyseMarket:
         )
         shares = np.array([r[0] for r in cur.fetchall()], dtype=np.float64)
         conn.close()
-        self._plot_size_density(shares, "Limit Order", n_log_bins,
+        self._plot_size_density(shares, "Limit Order", "LO", n_log_bins,
                                 mid_range=(2, 1000), tail_start=800)
 
     def mo_size_distribution(self, n_log_bins=35):
@@ -1013,7 +1212,7 @@ class AnalyseMarket:
         )
         shares = np.array([r[0] for r in cur.fetchall()], dtype=np.float64)
         conn.close()
-        self._plot_size_density(shares, "Market Order", n_log_bins,
+        self._plot_size_density(shares, "Market Order", "MO", n_log_bins,
                                 mid_range=(2, 200), tail_start=200)
 
     def conditional_size_vs_distance(self, num_bins=80):
@@ -1398,7 +1597,7 @@ class AnalyseMarket:
 
     # --- Price Impact by Depth ---
     def price_impact_by_depth(self, n_quartiles=4, max_tw_plot=15):
-        """Ticks-walked distribution by opposite-side depth quartile."""
+        """Market-order impact K by opposite-side depth quartile."""
         if "mo_orders" not in self.tables:
             print("No mo_orders table."); return
         data = self._load_mo_cum_depth(extra_cols="ticks_walked")
@@ -1438,7 +1637,7 @@ class AnalyseMarket:
                    color=colors[qi % 4], edgecolor="white")
             ax.set_ylabel("Fraction"); ax.set_title(label)
             if qi == n_quartiles - 1:
-                ax.set_xlabel("Ticks walked")
+                ax.set_xlabel(r"Impact $K$ (ticks)")
 
             ax = axes[qi, 1]
             max_k = min(int(tw.max()), 40)
@@ -1446,15 +1645,15 @@ class AnalyseMarket:
             survival = np.array([(tw >= k).mean() for k in k_vals])
             ax.semilogy(k_vals, survival, "o-",
                         color=colors[qi % 4], ms=3)
-            ax.set_ylabel("P(tw ≥ k)"); ax.set_title(label)
+            ax.set_ylabel(r"$\Pr(K \geq k)$"); ax.set_title(label)
             ax.grid(True, alpha=0.3)
             if qi == n_quartiles - 1:
-                ax.set_xlabel("k (ticks)")
+                ax.set_xlabel(r"$k$ (ticks)")
 
         plt.tight_layout(); plt.show()
 
         # Summary table
-        print(f"\n{'Quartile':>10s}  {'n':>8s}  {'mean tw':>8s}  "
+        print(f"\n{'Quartile':>10s}  {'n':>8s}  {'mean K':>8s}  "
               f"{'P(>0)':>7s}  {'P(≥5)':>8s}")
         for qi in range(n_quartiles):
             tw_qi = tw_all[dq == qi]
@@ -2079,7 +2278,7 @@ class AnalyseMarket:
             print(f"  {row['event_type']}: {int(row['cnt']):,}")
 
     def plot_candlestick(self, timeframe=60.0, ema_spans=None,
-                         n_events=None, offset=0):
+                         n_events=None, offset=0, title=None):
         """OHLC candlestick chart from fill/trade data.
 
         Parameters
@@ -2092,6 +2291,9 @@ class AnalyseMarket:
             Number of fills to include (``None`` = all).
         offset : int
             Skip this many fills from the start.
+        title : str or None
+            Custom chart title.  When ``None`` (default) an auto-generated
+            title showing the timeframe and candle count is used.
         """
         conn = self._conn()
         day_sql = self._day_clause()
@@ -2211,11 +2413,14 @@ class AnalyseMarket:
                     label=f"EMA {span}")
 
         ax.set_ylabel("Price")
-        tf_lbl = (f"{timeframe:.0f}s" if timeframe < 60 else
-                  (f"{timeframe/60:.0f}min" if timeframe < 3600 else
-                   f"{timeframe/3600:.1f}h"))
-        ax.set_title(f"Candlestick chart  (timeframe={tf_lbl}, "
-                     f"{n_candles} candles)")
+        if title is not None:
+            ax.set_title(title)
+        else:
+            tf_lbl = (f"{timeframe:.0f}s" if timeframe < 60 else
+                      (f"{timeframe/60:.0f}min" if timeframe < 3600 else
+                       f"{timeframe/3600:.1f}h"))
+            ax.set_title(f"Candlestick chart  (timeframe={tf_lbl}, "
+                         f"{n_candles} candles)")
         if ema_lines:
             ax.legend(loc="upper left", fontsize=8)
         ax.grid(True, alpha=0.3)
@@ -2569,17 +2774,17 @@ class AnalyseMarket:
     # --- Plot methods ---
     def price_impact_propagator(self, max_horizon=100, n_points=80,
                                 split_regimes=False):
-        """Raw impact R(τ) = E[ε_n (mid[n+τ] − mid[n]) / mid[n]]  and
-        normalised impact kernel G(τ) = R(τ) / C(τ).
+        """Price impact curve R(ℓ) = E[ε_i (M_{i+ℓ} − M_i) / M_i].
 
-        The horizon τ counts **MOs** (trade time), not LO/CXL events.
-        For real data the curve is computed per day then averaged so that
-        overnight price gaps do not contaminate the estimate.
+        The horizon ℓ counts **market orders** (event time), not
+        LO/CXL events.  For real data the curve is computed per day
+        then averaged so that overnight price gaps do not contaminate
+        the estimate.
 
         Parameters
         ----------
         max_horizon : int
-            Maximum horizon in MOs (default 1000).
+            Maximum horizon in MOs (default 100).
         n_points : int
             Number of log-spaced horizons to evaluate (default 80).
         split_regimes : bool
@@ -2595,7 +2800,6 @@ class AnalyseMarket:
         horizons = np.unique(
             np.geomspace(1, max_horizon, n_points).astype(int))
 
-        # --- Raw impact R(τ) ---
         def _plot_one(ax, label, color, mask=None):
             m, se = self._propagator_curve(mid_mo, sign_all, day_labels,
                                            horizons, ref_shift=0,
@@ -2609,10 +2813,8 @@ class AnalyseMarket:
             ax.fill_between(horizons, m - se, m + se,
                             alpha=0.18, color=color)
 
-        fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+        fig, ax = plt.subplots(figsize=(8, 5))
 
-        # Left: raw impact
-        ax = axes[0]
         if split_regimes:
             walked = tw > 0
             _plot_one(ax, "All", "steelblue")
@@ -2623,35 +2825,9 @@ class AnalyseMarket:
 
         ax.axhline(0, ls="--", color="grey", lw=0.8)
         ax.set_xscale("log")
-        ax.set_xlabel(r"Horizon $\tau$  (MOs)")
-        ax.set_ylabel("Mean signed return  (bps)")
-        ax.set_title(r"Raw impact  $R(\tau) = "
-                     r"\mathbb{E}[\epsilon_n\,"
-                     r"(m_{n+\tau} - m_n)/m_n]$")
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-
-        # Right: normalised kernel G = R / C
-        ax = axes[1]
-        m_all, se_all = self._propagator_curve(
-            mid_mo, sign_all, day_labels, horizons, ref_shift=0)
-        acf = self._sign_autocorr(sign_all, horizons)
-        acf_thresh = 0.01
-        G = np.full_like(m_all, np.nan)
-        acf_ok = np.abs(acf) > acf_thresh
-        G[acf_ok] = m_all[acf_ok] / acf[acf_ok]
-
-        ax.plot(horizons, m_all, "o-", ms=3, lw=1.2, color="steelblue",
-                label=r"$R(\tau)$ raw")
-        ax.plot(horizons[acf_ok], G[acf_ok], "s-", ms=3, lw=1.2,
-                color="tab:orange",
-                label=r"$G(\tau) = R/C$ normalised")
-        ax.axhline(0, ls="--", color="grey", lw=0.8)
-        ax.set_xscale("log")
-        ax.set_xlabel(r"Horizon $\tau$  (MOs)")
-        ax.set_ylabel("bps")
-        ax.set_title(r"Normalised impact kernel  "
-                     r"$G(\tau) = R(\tau)\,/\,C(\tau)$")
+        ax.set_xlabel(r"Horizon $\ell$  (market orders)")
+        ax.set_ylabel(r"$R(\ell)$  (bps)")
+        ax.set_title("Price Impact Curve")
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
 
@@ -2659,25 +2835,13 @@ class AnalyseMarket:
 
         # Summary
         walked = tw > 0
+        m_all, _ = self._propagator_curve(
+            mid_mo, sign_all, day_labels, horizons, ref_shift=0)
         print(f"MOs total: {N:,}")
         print(f"  walked ticks:    {walked.sum():,}")
         print(f"  no tick walk:    {(~walked).sum():,}")
-        if acf_ok[0]:
-            g1 = f"{G[0]:+.3f}"
-        else:
-            g1 = "n/a"
-        if acf_ok[-1]:
-            gl = f"{G[-1]:+.3f}"
-        else:
-            gl = "n/a"
-        print(f"  R(1)  = {m_all[0]:+.3f} bps   "
-              f"C(1)  = {acf[0]:.4f}   "
-              f"G(1)  = {g1} bps")
-        print(f"  R({horizons[-1]}) = {m_all[-1]:+.3f} bps   "
-              f"C({horizons[-1]}) = {acf[-1]:.4f}   "
-              f"G({horizons[-1]}) = {gl} bps")
-        print(f"  |C| > {acf_thresh} for "
-              f"{acf_ok.sum()}/{len(acf)} horizons")
+        print(f"  R(1)  = {m_all[0]:+.3f} bps")
+        print(f"  R({horizons[-1]}) = {m_all[-1]:+.3f} bps")
 
     def adjusted_impact_propagator(self, max_horizon=100, n_points=80,
                                    split_regimes=False):
@@ -2907,11 +3071,7 @@ class AnalyseMarket:
             Sampling interval for mid-prices (default 1 min).
         max_lag : int
             Maximum number of lags to compute (each lag =
-            *interval_minutes* minutes).  Default 60 covers one hour,
-            well past the 20-minute efficiency threshold.
-
-        Left panel : ACF vs lag in minutes.
-        Right panel: Mean |ACF| before vs after the 20-minute threshold.
+            *interval_minutes* minutes).  Default 60 covers one hour.
         """
         interval_sec = interval_minutes * 60.0
         sampled = self._get_sampled_mid_prices(interval_sec)
@@ -2933,64 +3093,18 @@ class AnalyseMarket:
         acf = np.array([np.dot(rets_dm[l:], rets_dm[:-l]) / var
                         for l in lags])
         lag_minutes = lags * interval_minutes
-        ci = 1.96 / np.sqrt(n)
 
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-        ax = axes[0]
-        colors = ["tab:red" if m <= 20 else "tab:blue"
-                  for m in lag_minutes]
+        fig, ax = plt.subplots(figsize=(8, 5))
         ax.bar(lag_minutes, acf, width=interval_minutes * 0.8, alpha=0.7,
-               color=colors)
-        ax.axhline(ci, ls="--", color="red", alpha=0.5, label="95% CI")
-        ax.axhline(-ci, ls="--", color="red", alpha=0.5)
+               color="steelblue")
         ax.axhline(0, color="black", lw=0.5)
-        ax.axvline(20.0, ls=":", color="green", lw=2, alpha=0.8,
-                   label="20 min threshold")
-        ax.bar([], [], color="tab:red", alpha=0.7, label="≤ 20 min")
-        ax.bar([], [], color="tab:blue", alpha=0.7, label="> 20 min")
-        ax.set_xlabel("Lag (minutes)"); ax.set_ylabel("Autocorrelation")
+        ax.set_xlabel("Lag (minutes)")
+        ax.set_ylabel("Autocorrelation")
         ax.set_title("ACF of log-returns")
-        ax.legend(fontsize=8, loc="upper right")
-
-        ax = axes[1]
-        bm = lag_minutes <= 20
-        am = lag_minutes > 20
-        if bm.any():
-            mab = np.abs(acf[bm]).mean()
-        else:
-            mab = 0
-        if am.any():
-            maa = np.abs(acf[am]).mean()
-        else:
-            maa = 0
-        n_before, n_after = int(bm.sum()), int(am.sum())
-
-        bars = ax.bar(
-            ["≤ 20 min\n(microstructure)", "> 20 min\n(efficient)"],
-            [mab, maa],
-            color=["tab:red", "tab:blue"], alpha=0.7, width=0.5,
-        )
-        ax.axhline(ci, ls="--", color="red", alpha=0.5, label="95% CI")
-        ax.set_ylabel("Mean |ACF|")
-        ax.set_title("Average absolute autocorrelation")
-        ax.legend(fontsize=8)
-        for bar, val, cnt in zip(bars, [mab, maa], [n_before, n_after]):
-            ax.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + 0.002,
-                    f"{val:.4f}\n({cnt} lags)",
-                    ha="center", fontsize=9)
-
-        plt.suptitle(
-            "Absence of return autocorrelation\n"
-            "(ACF ≈ 0 for horizons ≳ 20 min)",
-            fontsize=11,
-        )
         plt.tight_layout(); plt.show()
 
         print(f"Sampling interval: {interval_minutes} min")
-        print(f"Mean |ACF| ≤ 20 min: {mab:.4f}  ({n_before} lags)")
-        print(f"Mean |ACF| > 20 min: {maa:.4f}  ({n_after} lags)")
+        print(f"Mean |ACF|: {np.abs(acf).mean():.4f}  ({len(acf)} lags)")
 
     def stylized_return_autocorrelation_seconds(
         self, interval_seconds=1.0, max_lag=60,
@@ -3072,14 +3186,11 @@ class AnalyseMarket:
         acf_abs = self._acf(np.abs(rets), max_lag)
         acf_sq = self._acf(rets ** 2, max_lag)
         lag_minutes = np.arange(1, len(acf_abs) + 1) * interval_minutes
-        ci = 1.96 / np.sqrt(n)
 
         fig, axes = plt.subplots(1, 2, figsize=(13, 4), sharey=True)
 
         axes[0].bar(lag_minutes, acf_abs, width=interval_minutes * 0.8,
                     alpha=0.7, color="tab:blue")
-        axes[0].axhline(ci, ls="--", color="red", alpha=0.5)
-        axes[0].axhline(-ci, ls="--", color="red", alpha=0.5)
         axes[0].axhline(0, color="black", lw=0.5)
         axes[0].set_xlabel("Lag (minutes)")
         axes[0].set_ylabel("Autocorrelation")
@@ -3087,14 +3198,11 @@ class AnalyseMarket:
 
         axes[1].bar(lag_minutes, acf_sq, width=interval_minutes * 0.8,
                     alpha=0.7, color="tab:orange")
-        axes[1].axhline(ci, ls="--", color="red", alpha=0.5)
-        axes[1].axhline(-ci, ls="--", color="red", alpha=0.5)
         axes[1].axhline(0, color="black", lw=0.5)
         axes[1].set_xlabel("Lag (minutes)")
         axes[1].set_title("ACF of returns²")
 
-        plt.suptitle("Volatility clustering  "
-                     "(slow decay → clustering present)")
+        plt.suptitle("Volatility Clustering")
         plt.tight_layout(); plt.show()
 
         if acf_abs[0] > 0:
@@ -3223,20 +3331,15 @@ class AnalyseMarket:
         max_bar = min(max_lag_bar, n - 1)
         acf_short = self._acf_fft(signs, max_bar)   # [0..max_bar]
         lags_short = np.arange(1, max_bar + 1)
-        ci = 1.96 / np.sqrt(n)
 
         fig, axes = plt.subplots(1, 2, figsize=(14, 4))
 
         axes[0].bar(lags_short, acf_short[1:], width=0.8,
                     alpha=0.7, color="steelblue")
-        axes[0].axhline(ci, ls="--", color="red", alpha=0.5,
-                        label="95 % CI")
-        axes[0].axhline(-ci, ls="--", color="red", alpha=0.5)
         axes[0].axhline(0, lw=0.3, color="k")
-        axes[0].set_xlabel("Lag  $k$")
+        axes[0].set_xlabel(r"Lag  $\ell$")
         axes[0].set_ylabel("Autocorrelation")
         axes[0].set_title("Signed-trade ACF (linear)")
-        axes[0].legend(fontsize=8)
 
         # --- Panel 2: Log-log ACF with power-law fit ---
         max_ll = min(max_lag_loglog, n - 1)
@@ -3283,9 +3386,8 @@ class AnalyseMarket:
                 gamma_hat = -coefs[1]
                 intercept = coefs[0]
 
-                print(f"Power-law exponent:  "
-                      f"\u03b3 = {gamma_hat:.4f}   "
-                      f"(\u03c1(k) ~ k^{{-{gamma_hat:.4f}}})")
+                print(f"Order-sign \u03b3 = {gamma_hat:.4f}   "
+                      f"(\u03c1(\u2113) ~ \u2113^{{-{gamma_hat:.4f}}})")
             else:
                 gamma_hat = intercept = None
                 print("Not enough positive log-binned points in fit range.")
@@ -3300,13 +3402,13 @@ class AnalyseMarket:
                 xf = np.logspace(0, np.log10(max_ll), 200)
                 yf = np.exp(intercept) * xf ** (-gamma_hat)
                 axes[1].plot(xf, yf, color="crimson", lw=1.5,
-                             label=(rf"$\hat\rho(k) \propto "
-                                    rf"k^{{-{gamma_hat:.3f}}}$  "
-                                    rf"(fit $k\in[{fit_lo},{fit_hi}]$)"))
+                             label=(rf"$\hat\rho(\ell) \propto "
+                                    rf"\ell^{{-{gamma_hat:.3f}}}$  "
+                                    rf"(fit $\ell\in[{fit_lo},{fit_hi}]$)"))
 
             axes[1].set_xscale("log"); axes[1].set_yscale("log")
-            axes[1].set_xlabel("Lag  $k$")
-            axes[1].set_ylabel(r"Autocorrelation  $\hat\rho(k)$")
+            axes[1].set_xlabel(r"Lag  $\ell$")
+            axes[1].set_ylabel(r"Autocorrelation  $\hat\rho(\ell)$")
             axes[1].set_title("Order-sign ACF power-law decay")
             axes[1].legend(fontsize=9)
         else:
@@ -3654,7 +3756,7 @@ class AnalyseMarket:
         print(f"Cancellations:   {int(row[1]):>12,}")
         print(f"Total LO + CXL:  {int(row[2]):>12,}")
 
-    def cancel_prob_y(self):
+    def cancel_prob_y(self, log_scale=False):
         """P(y), P(y|C), P(C|y) via Bayes — Mike-Farmer y-ratio."""
         self._cancel_sequential_pass()
         P_C = self._compute_pc()
@@ -3677,6 +3779,21 @@ class AnalyseMarket:
         P_C_y = np.full_like(p_y, np.nan)
         P_C_y[ok] = P_C * p_y_c[ok] / p_y[ok]
 
+        valid = np.isfinite(P_C_y) & (P_C_y > 0)
+
+        if log_scale:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.plot(centers[valid], P_C_y[valid], "o-", ms=5, color="tab:blue")
+            ax.set_yscale("log")
+            ax.set_xlabel(r"$y = \Delta(t)/\Delta(0)$")
+            ax.set_ylabel("P(C | y)")
+            ax.set_title("Cancellation probability vs relative price movement")
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout(); plt.show()
+            print(f"P(C|y) range: [{np.nanmin(P_C_y[valid]):.4f}, "
+                  f"{np.nanmax(P_C_y[valid]):.4f}]")
+            return
+
         # --- plots ---
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
@@ -3686,15 +3803,14 @@ class AnalyseMarket:
                 label="log P(y)")
         ax.plot(centers[mask], np.log(p_y_c[mask]), "o-", ms=4,
                 label="log P(y|C)")
-        ax.set_xlabel("y = δ(t) / δ₀")
+        ax.set_xlabel(r"$y = \Delta(t)/\Delta(0)$")
         ax.set_ylabel("log probability")
         ax.set_title("P(y) vs P(y|C) — Mike-Farmer distributions")
         ax.legend(); ax.grid(True, alpha=0.3)
 
         ax = axes[1]
-        valid = np.isfinite(P_C_y) & (P_C_y > 0)
         ax.plot(centers[valid], P_C_y[valid], "o-", ms=5)
-        ax.set_xlabel("y = δ(t) / δ₀")
+        ax.set_xlabel(r"$y = \Delta(t)/\Delta(0)$")
         ax.set_ylabel("P(C | y)")
         ax.set_title("Cancellation probability vs relative price distance")
         ax.grid(True, alpha=0.3)
@@ -3782,7 +3898,11 @@ class AnalyseMarket:
         plt.tight_layout(); plt.show()
 
     def cancel_queue_position(self):
-        """Queue position at cancellation + Beta fit."""
+        """Queue position at cancellation + Beta fit on fractional position.
+
+        Reports fitted cancel-queue Beta parameters
+        :math:`\\hat\\alpha_f` and :math:`\\hat\\beta_f`.
+        """
         self._cancel_sequential_pass()
         pos  = self._cancel_positions
         qsz  = self._cancel_queue_sizes
@@ -3801,7 +3921,7 @@ class AnalyseMarket:
         interior = fracs[(fracs > 0) & (fracs < 1)]
         try:
             a_fit, b_fit, _, _ = beta_dist.fit(interior, floc=0, fscale=1)
-            print(f"\nFitted Beta(α={a_fit:.4f}, β={b_fit:.4f})")
+            print(f"\nFitted Beta(\u03b1\u0302_f={a_fit:.4f}, \u03b2\u0302_f={b_fit:.4f})")
         except (ValueError, RuntimeError):
             a_fit = b_fit = None
             print("Beta fit failed.")
@@ -3822,7 +3942,7 @@ class AnalyseMarket:
         if a_fit is not None:
             x_pdf = np.linspace(0.001, 0.999, 500)
             axes[1].plot(x_pdf, beta_dist.pdf(x_pdf, a_fit, b_fit), "r-",
-                         lw=2, label=f"Beta(α={a_fit:.3f}, β={b_fit:.3f})")
+                         lw=2, label=f"Beta(\u03b1\u0302_f={a_fit:.3f}, \u03b2\u0302_f={b_fit:.3f})")
         axes[1].set_xlabel("Fractional queue position  (pos / queue size)")
         axes[1].set_ylabel("Density")
         axes[1].set_title("Queue position at cancellation (fraction)")
@@ -4339,10 +4459,15 @@ class AnalyseMarket:
             if path.exists():
                 with open(path) as f:
                     cal = json.load(f)
-                defaults = {"tau_s": float(cal["resil_tau_s"]),
-                            "flow_tau_s": float(cal["resil_flow_tau_s"]),
-                            "kappa": float(cal["resil_kappa"]),
-                            "phi": float(cal["resil_phi"])}
+                # Accept both thesis-aligned keys and legacy names.
+                tau = cal.get("resil_tau", cal.get("resil_tau_s"))
+                tau_f = cal.get("resil_tau_f", cal.get("resil_flow_tau_s"))
+                kappa = cal.get("resil_kappa")
+                varphi = cal.get("resil_varphi", cal.get("resil_phi"))
+                defaults = {"tau_s": float(tau),
+                            "flow_tau_s": float(tau_f),
+                            "kappa": float(kappa),
+                            "phi": float(varphi)}
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
             pass
         return defaults
@@ -4618,11 +4743,11 @@ class AnalyseMarket:
             else:
                 src = "sessions"
             fig, ax = plt.subplots(figsize=(11, 4.6))
-            ax.plot(taus, vr_mean, lw=1.8, color="tab:red",
+            ax.plot(taus, vr_mean, lw=1.8, color="tab:blue",
                     label=f"{self.db_path.name}  "
                           f"({len(curves)} {src})")
             ax.fill_between(taus, vr_mean - vr_se, vr_mean + vr_se,
-                            color="tab:red", alpha=0.18, lw=0)
+                            color="tab:blue", alpha=0.18, lw=0)
             if overlay is not None:
                 ax.plot(overlay[0], overlay[1], lw=1.8, color="tab:blue",
                         label=f"overlay: {Path(str(compare_to)).name}")
@@ -4666,7 +4791,7 @@ class AnalyseMarket:
         Empirical validation of the state-dependent LO-placement mechanism at
         the *price* level: at each market order, sample the pre-MO band-pass
         displacement ``d`` and trend ``s`` (the same three-EMA signals that
-        drive ``resil_kappa`` / ``resil_phi`` in the simulator), then measure
+        drive ``resil_kappa`` / ``resil_varphi`` in the simulator), then measure
         the **signed markout** ``y(h) = eps * (mid(t0+h) - mid_base)`` in
         ticks, where ``eps`` is the MO direction (+1 buy / -1 sell).
         ``y > 0`` = the MO's move continues, ``y < 0`` = it reverts.

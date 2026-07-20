@@ -1,19 +1,18 @@
 """Phantom-order fill labelling pipeline for the competitive NN benchmark.
 
 Replays the historical event stream of an empirical KGHM SQLite database
-and, at each chosen timestamp ``t``, simulates a size-1 phantom limit
-order at every ``(delta, side)`` on the discrete tick grid.  Walks the
-merged ``orders + mo_orders`` stream forward to ``t + tau``, updating a
-per-delta ``queue_ahead`` tracker as cancellations and new same-side
-LOs ahead of the phantom occur.  Emits one row per ``(t, delta, side)``
-with a binary fill indicator and the feature vector required for the
-NN.
+and, at each chosen timestamp ``t``, simulates a phantom limit order at
+every legal resting price tick inside the configured delta bounds.  Delta
+is derived from that executable price and the exact BBO midpoint, so its
+parity naturally follows the spread (whole-tick or half-tick offsets).
+The merged ``orders + mo_orders`` stream is walked forward to ``t + tau``,
+updating a per-candidate ``queue_ahead`` tracker as cancellations and new
+same-side LOs ahead of the phantom occur.
 
 The phantom is treated as **invisible** to the market: real cancellations
 and new LOs in ``(t, t + tau]`` are applied unchanged even though some
-might not have occurred had the phantom really been there.  Phantom size
-is fixed at 1 share; the fill predicate is the clean inequality
-``mo_volume >= queue_ahead + 1``.
+might not have occurred had the phantom really been there.  The fill
+predicate is ``mo_volume >= queue_ahead + phantom_size``.
 
 Queue-position semantics (price-time priority):
 
@@ -48,7 +47,6 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 
-from . import _ergodic_solver as ergodic_solver
 from .hawkes_filter import (
     DEFAULT_LABELS,
     HawkesFilter,
@@ -72,6 +70,159 @@ DIM_CXL_ASK = 5
 
 
 # --- Feature schema ---
+
+
+def build_delta_grid(
+    tick_size: float, max_delta: float, delta_lo: float,
+) -> np.ndarray:
+    """Return the half-tick support possible across all legal BBO midpoints."""
+    step = float(tick_size)
+    lo = float(delta_lo)
+    hi = float(max_delta)
+    if not math.isfinite(step) or step <= 0.0:
+        raise ValueError("tick_size must be positive")
+    if not (math.isfinite(lo) and math.isfinite(hi)) or hi < lo:
+        raise ValueError("max_delta must be finite and >= delta_lo")
+    index_lo = int(math.ceil(lo / step - 1e-9))
+    index_hi = int(math.floor(hi / step + 1e-9))
+    if index_hi < index_lo:
+        return np.empty(0, dtype=np.float64)
+    return step * np.arange(index_lo, index_hi + 1, dtype=np.float64)
+
+
+INVALID_PRICE_TICK = np.iinfo(np.int64).min
+
+
+def _price_to_tick_index(price: float, tick_size: float) -> int:
+    """Convert an executable price to its integer tick index."""
+    price_value = float(price)
+    tick = float(tick_size)
+    if not math.isfinite(tick) or tick <= 0.0:
+        raise ValueError("tick_size must be positive")
+    if not math.isfinite(price_value):
+        raise ValueError(f"price must be finite, got {price!r}")
+    scaled = price_value / tick
+    nearest = int(round(scaled))
+    if not math.isclose(
+        scaled, nearest, rel_tol=0.0, abs_tol=1e-6,
+    ):
+        raise ValueError(
+            f"price {price!r} is not aligned to tick_size={tick_size!r}"
+        )
+    return nearest
+
+
+def _prices_to_tick_indices(
+    prices: np.ndarray, tick_size: float,
+) -> np.ndarray:
+    """Vectorised price-to-tick conversion; non-finite prices use a sentinel."""
+    tick = float(tick_size)
+    if not math.isfinite(tick) or tick <= 0.0:
+        raise ValueError("tick_size must be positive")
+    values = np.asarray(prices, dtype=np.float64)
+    out = np.full(values.shape, INVALID_PRICE_TICK, dtype=np.int64)
+    finite = np.isfinite(values)
+    if not finite.any():
+        return out
+    scaled = values[finite] / tick
+    nearest = np.rint(scaled)
+    aligned = np.isclose(scaled, nearest, rtol=0.0, atol=1e-6)
+    if not aligned.all():
+        bad = values[finite][~aligned][:5]
+        raise ValueError(
+            f"found off-tick order prices for tick_size={tick_size}: "
+            f"{bad.tolist()}"
+        )
+    out[finite] = nearest.astype(np.int64)
+    return out
+
+
+def build_legal_tick_state(
+    best_bid: float,
+    best_ask: float,
+    bid_depth: np.ndarray,
+    ask_depth: np.ndarray,
+    side: int,
+    *,
+    tick_size: float,
+    delta_lo: float,
+    max_delta: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return legal phantom prices, mid-relative deltas, and queue ahead.
+
+    Candidate prices are integer market ticks and cannot cross the opposite
+    BBO.  Delta is represented internally in half-ticks because the midpoint
+    of two legal prices can lie halfway between ticks.
+    """
+    tick = float(tick_size)
+    if not math.isfinite(tick) or tick <= 0.0:
+        raise ValueError("tick_size must be positive")
+    if float(max_delta) < float(delta_lo):
+        raise ValueError("max_delta must be >= delta_lo")
+    if side not in (1, 2):
+        raise ValueError(f"side must be 1 (bid) or 2 (ask), got {side!r}")
+
+    bid_tick = _price_to_tick_index(best_bid, tick)
+    ask_tick = _price_to_tick_index(best_ask, tick)
+    if ask_tick <= bid_tick:
+        raise ValueError(
+            f"invalid BBO: best_bid={best_bid!r}, best_ask={best_ask!r}"
+        )
+
+    midpoint_2ticks = bid_tick + ask_tick
+    half_tick = tick / 2.0
+    delta_2ticks_lo = int(math.ceil(float(delta_lo) / half_tick - 1e-9))
+    delta_2ticks_hi = int(math.floor(float(max_delta) / half_tick + 1e-9))
+
+    def ceil_div2(value: int) -> int:
+        return -((-value) // 2)
+
+    if side == 1:
+        price_tick_lo = max(
+            1, ceil_div2(midpoint_2ticks - delta_2ticks_hi),
+        )
+        price_tick_hi = min(
+            ask_tick - 1,
+            (midpoint_2ticks - delta_2ticks_lo) // 2,
+        )
+    else:
+        price_tick_lo = max(
+            1,
+            bid_tick + 1,
+            ceil_div2(midpoint_2ticks + delta_2ticks_lo),
+        )
+        price_tick_hi = (midpoint_2ticks + delta_2ticks_hi) // 2
+
+    if price_tick_hi < price_tick_lo:
+        empty = np.empty(0, dtype=np.float64)
+        return empty, empty.copy(), empty.copy()
+
+    if side == 1:
+        price_ticks = np.arange(
+            price_tick_hi, price_tick_lo - 1, -1, dtype=np.int64,
+        )
+        delta_2ticks = midpoint_2ticks - 2 * price_ticks
+        cumulative_depth = np.concatenate(
+            ([0.0], np.cumsum(np.asarray(bid_depth, dtype=np.float64))),
+        )
+        depth_level = bid_tick - price_ticks
+    else:
+        price_ticks = np.arange(
+            price_tick_lo, price_tick_hi + 1, dtype=np.int64,
+        )
+        delta_2ticks = 2 * price_ticks - midpoint_2ticks
+        cumulative_depth = np.concatenate(
+            ([0.0], np.cumsum(np.asarray(ask_depth, dtype=np.float64))),
+        )
+        depth_level = price_ticks - ask_tick
+
+    queue_index = np.clip(
+        depth_level + 1, 0, cumulative_depth.shape[0] - 1,
+    )
+    prices = price_ticks.astype(np.float64) * tick
+    deltas = delta_2ticks.astype(np.float64) * half_tick
+    queue_ahead = cumulative_depth[queue_index]
+    return prices, deltas, queue_ahead
 
 
 def build_feature_names(n_kernels: int, n_levels: int) -> List[str]:
@@ -204,14 +355,18 @@ class PhantomLabelConfig:
     """Phantom horizon in seconds."""
 
     delta_lo: float = -0.50
-    """Lower bound (PLN) of the delta grid.  Negative ⇒ phantom inside the spread."""
+    """Lower bound (PLN) for mid-relative candidate deltas."""
 
     max_delta: float = 2.0
-    """Upper bound (PLN) of the delta grid."""
+    """Upper bound (PLN) for mid-relative candidate deltas."""
 
     tick_size: float = 0.05
-    """Price increment in PLN.  Drives both the delta grid and the
-    snapshot-level → price mapping."""
+    """Executable market-price increment in PLN."""
+
+    grid_mode: str = "legal_price_ticks"
+    """Candidate construction. ``legal_price_ticks`` emits only executable
+    absolute prices; ``uniform`` reproduces the historical midpoint-relative
+    delta grid used by the profitable simulation pipeline."""
 
     phantom_size: int = 1
     """Size (shares) of the hypothetical limit order."""
@@ -269,7 +424,7 @@ class PhantomLabeller:
         resolved via :func:`research_core.classes.helpers.resolve_data_path`).
     config : PhantomLabelConfig, optional
         Labelling parameters.  Defaults match the rest of the pipeline
-        (tau=1s, KGHM tick=0.05 PLN, delta grid [-0.50, 2.00]).
+        (tau=1s, KGHM tick=0.05 PLN, delta bounds [-0.50, 2.00]).
     hawkes : HawkesFilter / factory / bool, optional
         Hawkes filter to use.  ``True`` (default) installs the KGHM
         **single-kernel** multivariate calibration (same as
@@ -303,10 +458,26 @@ class PhantomLabeller:
         self.feature_names: Tuple[str, ...] = tuple(
             build_feature_names(self._n_kernels, self.n_book_levels)
         )
-        self.delta_grid = ergodic_solver.build_delta_grid(
-            self.config.tick_size, self.config.max_delta, self.config.delta_lo,
+        self.grid_mode = str(self.config.grid_mode)
+        if self.grid_mode not in ("uniform", "legal_price_ticks"):
+            raise ValueError(
+                "grid_mode must be 'uniform' or 'legal_price_ticks', "
+                f"got {self.grid_mode!r}"
+            )
+        grid_step = (
+            self.config.tick_size / 2.0
+            if self.grid_mode == "legal_price_ticks"
+            else self.config.tick_size
+        )
+        self.delta_grid = build_delta_grid(
+            grid_step, self.config.max_delta, self.config.delta_lo,
         )
         self.n_delta = self.delta_grid.shape[0]
+        self.max_candidates_per_side = (
+            (self.n_delta + 1) // 2
+            if self.grid_mode == "legal_price_ticks"
+            else self.n_delta
+        )
 
     # --- Public API ---
 
@@ -337,7 +508,7 @@ class PhantomLabeller:
         Returns
         -------
         pd.DataFrame
-            ``2 * n_delta`` rows per labelling timestamp; columns are
+            Rows for each candidate delta and side; columns are
             ``[t_ns, side, delta, queue_ahead] + feature_names + [label]``.
             Empty DataFrame if the day has no usable rows.
         """
@@ -366,15 +537,30 @@ class PhantomLabeller:
             cols[name] = {"dtype": "float32", "role": "feature"}
         cols["label"] = {"dtype": "uint8", "role": "target",
                          "values": {"0": "no_fill", "1": "fill"}}
+        delta_grid_meta = {
+            "mode": self.grid_mode,
+            "lo": float(self.config.delta_lo),
+            "hi": float(self.config.max_delta),
+            "step": float(
+                self.config.tick_size / 2.0
+                if self.grid_mode == "legal_price_ticks"
+                else self.config.tick_size
+            ),
+            "n_points": int(self.n_delta),
+        }
+        if self.grid_mode == "legal_price_ticks":
+            delta_grid_meta.update({
+                "price_tick": float(self.config.tick_size),
+                "max_points_per_side": int(self.max_candidates_per_side),
+                "variable_points_per_timestamp": True,
+            })
+        else:
+            delta_grid_meta["variable_points_per_timestamp"] = False
+
         return {
             "tau": float(self.config.tau),
             "tick_size": float(self.config.tick_size),
-            "delta_grid": {
-                "lo": float(self.config.delta_lo),
-                "hi": float(self.config.max_delta),
-                "step": float(self.config.tick_size),
-                "n_points": int(self.n_delta),
-            },
+            "delta_grid": delta_grid_meta,
             "phantom_size": int(self.config.phantom_size),
             "cadence": str(self.config.cadence),
             "vol_halflife": int(self.config.vol_halflife),
@@ -469,9 +655,10 @@ class PhantomLabeller:
         """Return numpy arrays for the merged orders + mo event stream.
 
         Output dict keys: ``t_ns``, ``kind`` (Hawkes dim 0..5), ``side``
-        (1=bid, 2=ask), ``price`` (NaN for MOs), ``volume``.  Events at
-        identical timestamps preserve relative order: orders before MOs
-        within a tie, matching ``MMBacktester._replay`` semantics.
+        (1=bid, 2=ask), integer ``price_tick`` (sentinel for MOs), and
+        ``volume``. Events at identical timestamps preserve relative order:
+        orders before MOs within a tie, matching ``MMBacktester._replay``
+        semantics.
         """
         # orders
         o_t = orders_df["t_ns"].to_numpy(dtype=np.int64)
@@ -493,13 +680,16 @@ class PhantomLabeller:
             o_side = o_side[keep_o]
             o_price = o_price[keep_o]
             o_vol = o_vol[keep_o]
+        o_price_tick = _prices_to_tick_indices(
+            o_price, self.config.tick_size,
+        )
 
         # mos
         if mos_df.empty:
             m_t = np.empty(0, dtype=np.int64)
             m_kind = np.empty(0, dtype=np.int8)
             m_side = np.empty(0, dtype=np.int8)
-            m_price = np.empty(0, dtype=np.float64)
+            m_price_tick = np.empty(0, dtype=np.int64)
             m_vol = np.empty(0, dtype=np.float64)
         else:
             m_t = mos_df["t_ns"].to_numpy(dtype=np.int64)
@@ -520,7 +710,9 @@ class PhantomLabeller:
                 m_kind = m_kind[keep_m]
                 m_side_int = m_side_int[keep_m]
             m_side = m_side_int
-            m_price = np.full(m_t.shape[0], np.nan, dtype=np.float64)
+            m_price_tick = np.full(
+                m_t.shape[0], INVALID_PRICE_TICK, dtype=np.int64,
+            )
             m_vol = mos_df["mo_volume"].to_numpy(dtype=np.float64)
             if not keep_m.all():
                 m_vol = m_vol[keep_m]
@@ -534,7 +726,7 @@ class PhantomLabeller:
         ev_t = np.concatenate([o_t, m_t])
         ev_kind = np.concatenate([o_kind, m_kind])
         ev_side = np.concatenate([o_side, m_side])
-        ev_price = np.concatenate([o_price, m_price])
+        ev_price_tick = np.concatenate([o_price_tick, m_price_tick])
         ev_volume = np.concatenate([o_vol, m_vol])
         # Tag with 0 (order) / 1 (mo) for stable tie-breaking.
         ev_tag = np.concatenate([
@@ -546,7 +738,7 @@ class PhantomLabeller:
             "t_ns": ev_t[order],
             "kind": ev_kind[order],
             "side": ev_side[order],
-            "price": ev_price[order],
+            "price_tick": ev_price_tick[order],
             "volume": ev_volume[order],
         }
 
@@ -586,36 +778,46 @@ class PhantomLabeller:
 
     # --- Initial queue_ahead from snapshot depth ---
 
-    def _initial_state(self, mid: float, bb: float, ba: float, bid_depth: np.ndarray, ask_depth: np.ndarray, side: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Phantom prices and ``queue_ahead`` for every δ on the grid.
+    def _initial_state(
+        self,
+        mid: float,
+        bb: float,
+        ba: float,
+        bid_depth: np.ndarray,
+        ask_depth: np.ndarray,
+        side: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Phantom prices, mid-relative deltas, and initial queue ahead."""
+        if self.grid_mode == "legal_price_ticks":
+            return build_legal_tick_state(
+                bb,
+                ba,
+                bid_depth,
+                ask_depth,
+                side,
+                tick_size=self.config.tick_size,
+                delta_lo=self.config.delta_lo,
+                max_delta=self.config.max_delta,
+            )
 
-        For side=1 (bid) phantom at ``mid - δ`` and the snapshot depths
-        at L0..L{n_queue_levels-1}:
-
-        - if phantom price > bb (inside spread): queue_ahead = 0
-        - else, the phantom sits at level ``k = ⌊(bb - p)/tick⌋``
-          (clamped to available levels); queue_ahead = ``sum(L0..Lk)``.
-
-        Saturates at total visible depth for phantoms beyond the snapshot.
-        Symmetric for the ask side.
-        """
         tick = float(self.config.tick_size)
         eps = 1e-9
         if side == 1:
             phantom_prices = float(mid) - self.delta_grid
-            cum = np.concatenate([[0.0], np.cumsum(bid_depth)])
-            ticks_below = (float(bb) - phantom_prices) / tick
-            k_raw = np.floor(ticks_below + eps).astype(np.int64)
-            k = np.clip(k_raw + 1, 0, len(cum) - 1)
-            queue = cum[k]
+            cumulative_depth = np.concatenate([[0.0], np.cumsum(bid_depth)])
+            ticks_from_best = (float(bb) - phantom_prices) / tick
         else:
             phantom_prices = float(mid) + self.delta_grid
-            cum = np.concatenate([[0.0], np.cumsum(ask_depth)])
-            ticks_above = (phantom_prices - float(ba)) / tick
-            k_raw = np.floor(ticks_above + eps).astype(np.int64)
-            k = np.clip(k_raw + 1, 0, len(cum) - 1)
-            queue = cum[k]
-        return phantom_prices.astype(np.float64), queue.astype(np.float64)
+            cumulative_depth = np.concatenate([[0.0], np.cumsum(ask_depth)])
+            ticks_from_best = (phantom_prices - float(ba)) / tick
+        level = np.floor(ticks_from_best + eps).astype(np.int64)
+        queue_index = np.clip(level + 1, 0, len(cumulative_depth) - 1)
+        queue = cumulative_depth[queue_index]
+        return (
+            phantom_prices.astype(np.float64),
+            self.delta_grid.astype(np.float64),
+            queue.astype(np.float64),
+        )
 
     # --- Inner phantom replay ---
 
@@ -626,11 +828,23 @@ class PhantomLabeller:
         queue_ahead_init: np.ndarray,
         ev_kind: np.ndarray,
         ev_side: np.ndarray,
-        ev_price: np.ndarray,
+        ev_price_tick: np.ndarray,
         ev_volume: np.ndarray,
     ) -> np.ndarray:
-        """Vectorised per-δ replay; returns a length-``n_delta`` uint8 array."""
+        """Vectorised per-candidate replay; returns binary fill labels."""
         n_d = phantom_prices.shape[0]
+        if self.grid_mode == "legal_price_ticks":
+            phantom_price_ticks = _prices_to_tick_indices(
+                phantom_prices, self.config.tick_size,
+            )
+        else:
+            # Historical uniform candidates may be half a market tick off-grid
+            # when the BBO midpoint itself lies between ticks. Comparisons in
+            # tick units preserve the original float-price queue semantics.
+            phantom_price_ticks = (
+                np.asarray(phantom_prices, dtype=np.float64)
+                / float(self.config.tick_size)
+            )
         queue = queue_ahead_init.astype(np.float64, copy=True)
         labels = np.zeros(n_d, dtype=np.uint8)
         unfilled = np.ones(n_d, dtype=bool)
@@ -663,25 +877,25 @@ class PhantomLabeller:
                         queue,
                     )
             elif k == lo_dim:
-                p = float(ev_price[i])
+                p_tick = int(ev_price_tick[i])
                 v = float(ev_volume[i])
-                if v <= 0.0 or not math.isfinite(p):
+                if v <= 0.0 or p_tick == INVALID_PRICE_TICK:
                     continue
                 if side == 1:
-                    ahead = unfilled & (p > phantom_prices)
+                    ahead = unfilled & (p_tick > phantom_price_ticks)
                 else:
-                    ahead = unfilled & (p < phantom_prices)
+                    ahead = unfilled & (p_tick < phantom_price_ticks)
                 if ahead.any():
                     queue[ahead] += v
             elif k == cxl_dim:
-                p = float(ev_price[i])
+                p_tick = int(ev_price_tick[i])
                 v = float(ev_volume[i])
-                if v <= 0.0 or not math.isfinite(p):
+                if v <= 0.0 or p_tick == INVALID_PRICE_TICK:
                     continue
                 if side == 1:
-                    ahead = unfilled & (p > phantom_prices)
+                    ahead = unfilled & (p_tick > phantom_price_ticks)
                 else:
-                    ahead = unfilled & (p < phantom_prices)
+                    ahead = unfilled & (p_tick < phantom_price_ticks)
                 if ahead.any():
                     queue[ahead] = np.maximum(queue[ahead] - v, 0.0)
             # Other kinds (opposite-side LO/CXL, same-direction MO) do
@@ -701,7 +915,7 @@ class PhantomLabeller:
         ev_t_ns = stream["t_ns"]
         ev_kind = stream["kind"]
         ev_side = stream["side"]
-        ev_price = stream["price"]
+        ev_price_tick = stream["price_tick"]
         ev_volume = stream["volume"]
 
         label_indices = self._choose_label_indices(orders_df)
@@ -742,8 +956,9 @@ class PhantomLabeller:
         n_events = ev_t_ns.shape[0]
         tau_ns = int(self.config.tau * 1e9)
 
-        n_d = self.n_delta
-        n_rows = label_indices.size * 2 * n_d
+        n_rows = (
+            label_indices.size * 2 * self.max_candidates_per_side
+        )
         n_feat = len(self.feature_names)
 
         # Pre-allocate output arrays for speed.
@@ -754,8 +969,6 @@ class PhantomLabeller:
         out_features = np.empty((n_rows, n_feat), dtype=np.float32)
         out_label = np.empty(n_rows, dtype=np.uint8)
         output_row = 0
-
-        delta_grid_f32 = self.delta_grid.astype(np.float32)
 
         for label_row_index in label_indices:
             t_ns_lab = int(t_ns_all[label_row_index])
@@ -812,28 +1025,34 @@ class PhantomLabeller:
             ))
             window_kind = ev_kind[i_start:i_end]
             window_side = ev_side[i_start:i_end]
-            window_price = ev_price[i_start:i_end]
             window_volume = ev_volume[i_start:i_end]
 
             for side_int in (1, 2):
-                phantom_prices, queue_init = self._initial_state(
+                phantom_prices, deltas, queue_init = self._initial_state(
                     mid_lab, bb_lab, ba_lab,
                     bid_depths[label_row_index], ask_depths[label_row_index],
                     side=side_int,
                 )
+                n_side_candidates = phantom_prices.shape[0]
+                if n_side_candidates == 0:
+                    continue
                 labels = self._replay(
                     side_int, phantom_prices, queue_init,
-                    window_kind, window_side, window_price, window_volume,
+                    window_kind,
+                    window_side,
+                    ev_price_tick[i_start:i_end],
+                    window_volume,
                 )
-                # Emit n_d rows for this (t, side).
-                output_slice = slice(output_row, output_row + n_d)
+                output_slice = slice(
+                    output_row, output_row + n_side_candidates,
+                )
                 out_t[output_slice] = t_ns_lab
                 out_side[output_slice] = side_int
-                out_delta[output_slice] = delta_grid_f32
+                out_delta[output_slice] = deltas.astype(np.float32)
                 out_queue[output_slice] = queue_init.astype(np.float32)
                 out_features[output_slice, :] = feature_vector  # broadcasts to all δ rows
                 out_label[output_slice] = labels
-                output_row += n_d
+                output_row += n_side_candidates
 
         if output_row == 0:
             return self._empty_frame()
@@ -906,6 +1125,7 @@ def write_manifest(
     runtime_seconds: float,
     git_commit: Optional[str] = None,
     hawkes_n_kernels: Optional[int] = None,
+    hawkes_filter: Optional[str] = None,
 ) -> Path:
     """Write builder provenance to ``manifest.json``.
 
@@ -920,6 +1140,7 @@ def write_manifest(
         "git_commit": git_commit,
         "source_db": str(db_path),
         "config": {
+            "grid_mode": str(config.grid_mode),
             "tau": float(config.tau),
             "delta_lo": float(config.delta_lo),
             "max_delta": float(config.max_delta),
@@ -940,6 +1161,8 @@ def write_manifest(
     }
     if hawkes_n_kernels is not None:
         manifest["hawkes_n_kernels"] = int(hawkes_n_kernels)
+    if hawkes_filter is not None:
+        manifest["hawkes_filter"] = str(hawkes_filter)
     path = directory / "manifest.json"
     path.write_text(json.dumps(manifest, indent=2, sort_keys=False))
     return path

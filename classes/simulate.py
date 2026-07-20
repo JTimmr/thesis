@@ -8,8 +8,9 @@ This is the single simulation engine for the project. Performance features:
 - Whole-LO market-order matching (rounds to the nearest resting order boundary)
 - math.log for scalar calls
 
-``SimulateFast`` is kept as a backwards-compatible alias for ``Simulate`` at the
-bottom of this module (the old pure-NumPy fork has been merged into this file).
+The simulator uses the calibrated six-dimensional multivariate Hawkes kernel
+throughout. Older Poisson and univariate Hawkes modes have been removed from the
+research workflow.
 
 Four recording modes control the storage/performance trade-off:
 
@@ -53,6 +54,12 @@ from .orderbook import HeapOrderBook
 
 
 # --- Numba-accelerated helpers (module level, compiled once) ---
+
+@numba.njit(cache=True)
+def seed_numba_rng(seed):
+    """Seed Numba's RNG state in the current simulation worker."""
+    np.random.seed(seed)
+
 
 @numba.njit(cache=True)
 def _compute_intensities_jit(baseline, A_stack, adj_stack, decay_stack, dt, n_kernels):
@@ -214,7 +221,7 @@ class HeapOrderBookFast(HeapOrderBook):
 
 
 class Simulate:
-    def __init__(self, arrival_mode, T,
+    def __init__(self, T,
                  agents=None,
                  db_path=None, flush_every=50_000,
                  lightweight=False, recording_mode=None,
@@ -222,22 +229,20 @@ class Simulate:
                  liquidity_guard=True, agents_when_lightweight=False,
                  shuffle_agents=False, agents_affect_kernels=True,
                  agents_affect_mo_sizing=True,
-                 lo_inside_spread_scale=1.0,
-                 lo_p_best=0.10,
-                 lo_inside_c1=0.022021, lo_inside_c0=0.006944,
-                 lo_inside_c1_hi=0.003620, lo_inside_c0_hi=0.163207,
-                 lo_inside_break=9,
+                 rho_in=1.0,
+                 pi_best=0.10,
+                 pi_in_c1=0.022021, pi_in_c0=0.006944,
+                 pi_in_c1_hi=0.003620, pi_in_c0_hi=0.163207,
+                 pi_in_break=9,
                  tick_size=0.05, alpha_scale=0.9, drift_eps=0.0,
                  mo_self_scale=1.0, mo_impact_scale=1.0,
-                 resil_kappa=0.0, resil_tau_s=10.0, resil_phi=0.0,
-                 resil_flow_tau_s=40.0, resil_xcap=4.0, resil_pmax=0.85,
+                 resil_kappa=0.0, resil_tau=10.0, resil_varphi=0.0,
+                 resil_tau_f=40.0, x_cap=4.0, pi_max=0.85,
                  verbose=True, capture_mid=False):
         """Initialise the simulator (Numba-accelerated variant).
 
         Parameters
         ----------
-        arrival_mode : str
-            ``'poisson'``, ``'hawkes_univariate'``, or ``'hawkes_multivariate'``.
         T : int
             Number of events to simulate.
         recording_mode : {'full', 'medium', 'bbo', 'lightweight'}, optional
@@ -266,17 +271,17 @@ class Simulate:
             :meth:`inject_event` excite the Hawkes intensity.  When
             ``False`` the agents still trade through the book but their
             order events do not feed the Hawkes excitation state.
-        lo_inside_spread_scale : float, optional
-            Multiplicative scale on the probability that a sampled
-            background limit order is placed inside the spread.  Default
-            ``1.0`` reproduces calibrated behaviour; ``0.0`` disables
-            in-spread placement entirely.
-        lo_p_best : float, optional
+        rho_in : float, optional
+            Multiplicative scale (thesis ρ_in) on the probability that a
+            sampled background limit order is placed inside the spread.
+            Default ``1.0`` reproduces calibrated behaviour; ``0.0``
+            disables in-spread placement entirely.
+        pi_best : float, optional
             Baseline probability that a background limit order joins the
             own-side best quote.  Empirical KGHM value (flat in spread
             over the well-populated range ``S <= 5``): ``0.10``.
-        lo_inside_c1, lo_inside_c0, lo_inside_c1_hi, lo_inside_c0_hi,
-        lo_inside_break : optional
+        pi_in_c1, pi_in_c0, pi_in_c1_hi, pi_in_c0_hi,
+        pi_in_break : optional
             Piecewise-linear baseline inside-spread placement probability
 
             ``P(inside | S) = 0``                     for ``S < 2``
@@ -294,10 +299,10 @@ class Simulate:
         resil_kappa : float, optional
             Strength of the order-book *resiliency* (stimulated-refill)
             mechanism.  The mid is tracked against a band-pass anchor built
-            from two EMAs (time constants ``resil_tau_s`` and
-            ``2 * resil_tau_s``): ``dev = mid - 2*EMA_tau + EMA_2tau``.
+            from two EMAs (time constants ``resil_tau`` and
+            ``2 * resil_tau``): ``dev = mid - 2*EMA_tau + EMA_2tau``.
             ``dev`` responds fully to a sudden displacement and decays
-            within ~``1.4 * resil_tau_s``, but is exactly zero for a
+            within ~``1.4 * resil_tau``, but is exactly zero for a
             steadily trending mid, so persistent (momentum) moves are not
             dragged.  When             ``dev`` is ``x`` ticks, background limit orders
             on the side that would revert the displacement have their
@@ -312,37 +317,35 @@ class Simulate:
             (signature plot dip) while leaving long-horizon dynamics
             intact.  Default ``0.0`` disables the mechanism entirely
             (calibrated legacy behaviour).
-        resil_tau_s : float, optional
+        resil_tau : float, optional
             Fast EMA time constant (seconds) of the resiliency anchor: sets
             the horizon at which reversion pressure acts (dip trough near
             ``~tau``).  Default ``10.0``.
-        resil_phi : float, optional
+        resil_varphi : float, optional
             Strength of the complementary *trend-chasing* placement bias.
             A smoothed trend signal ``s = EMA_tau - EMA_tau_flow`` (zero at
             the instant of a price jump, builds only when a move persists,
             steady-state ``v * (tau_flow - tau)`` along a trend of speed
             ``v``) shifts the momentum side's at-best/inside placement
             probabilities up by the same rate-preserving
-            ``1 +/- tanh(resil_phi * s)`` reshuffle.  This propagates
+            ``1 +/- tanh(resil_varphi * s)`` reshuffle.  This propagates
             persistent moves
             (liquidity providers re-quote in the direction of the
             prevailing flow), producing the medium-horizon variance-ratio
             rise above 1 seen empirically, without touching the
             short-horizon dip created by ``resil_kappa``.  Default ``0.0``
             (off).
-        resil_flow_tau_s : float, optional
+        resil_tau_f : float, optional
             Slow EMA time constant (seconds) of the trend signal.
             Default ``40.0``.
-        resil_xcap : float, optional
+        x_cap : float, optional
             Clip on the tick deviations used in the placement multipliers
             (guards against runaway multipliers after large moves).
             Default ``4.0``.
-        resil_pmax : float, optional
+        pi_max : float, optional
             Upper bound on the boosted ``p_best + p_inside`` placement
             probability mass.  Default ``0.85``.
         """
-        self.arrival_mode = arrival_mode
-
         if recording_mode is not None:
             if recording_mode not in ('full', 'medium', 'bbo', 'lightweight'):
                 raise ValueError(
@@ -372,22 +375,22 @@ class Simulate:
         self.shuffle_agents = bool(shuffle_agents)
         self.agents_affect_kernels = bool(agents_affect_kernels)
         self.agents_affect_mo_sizing = bool(agents_affect_mo_sizing)
-        self.lo_inside_spread_scale = float(lo_inside_spread_scale)
-        self.lo_p_best = float(lo_p_best)
-        self.lo_inside_c1 = float(lo_inside_c1)
-        self.lo_inside_c0 = float(lo_inside_c0)
-        self.lo_inside_c1_hi = float(lo_inside_c1_hi)
-        self.lo_inside_c0_hi = float(lo_inside_c0_hi)
-        self.lo_inside_break = int(lo_inside_break)
+        self.rho_in = float(rho_in)
+        self.pi_best = float(pi_best)
+        self.pi_in_c1 = float(pi_in_c1)
+        self.pi_in_c0 = float(pi_in_c0)
+        self.pi_in_c1_hi = float(pi_in_c1_hi)
+        self.pi_in_c0_hi = float(pi_in_c0_hi)
+        self.pi_in_break = int(pi_in_break)
         self.mo_self_scale = float(mo_self_scale)
         self.mo_impact_scale = float(mo_impact_scale)
         # --- Resiliency placement bias ---
         self.resil_kappa = float(resil_kappa)
-        self.resil_tau_s = float(resil_tau_s)
-        self.resil_phi = float(resil_phi)
-        self.resil_flow_tau_s = float(resil_flow_tau_s)
-        self.resil_xcap = float(resil_xcap)
-        self.resil_pmax = float(resil_pmax)
+        self.resil_tau = float(resil_tau)
+        self.resil_varphi = float(resil_varphi)
+        self.resil_tau_f = float(resil_tau_f)
+        self.x_cap = float(x_cap)
+        self.pi_max = float(pi_max)
         self._resil_ema = None      # fast EMA (tau) of the mid, tick units
         self._resil_ema2 = None     # slow EMA (2*tau) of the mid, tick units
         self._resil_ema_flow = None  # trend EMA (flow_tau) of the mid
@@ -454,30 +457,7 @@ class Simulate:
         self._tw_warmup = 2000
         self._tw_recalib_interval = 500
 
-        # Poisson baseline rates
-        self.poisson_rates = {
-            "MO_bid": 0.071652,
-            "MO_ask": 0.066922,
-            "LO_bid": 0.656950,
-            "LO_ask": 0.652339,
-            "CXL_bid": 0.656051,
-            "CXL_ask": 0.651098
-        }
-
-        # Univariate Hawkes parameters
-        self.univariate_baseline = np.array([
-            0.019840, 0.018044, 0.164048, 0.165068, 0.205264, 0.204799
-        ])
-
-        self.univariate_adjacency = np.diag([
-            0.724101, 0.730989, 0.750187, 0.746101, 0.687174, 0.685461
-        ])
-
-        self.univariate_decays = np.diag([
-            19.977277, 19.981433, 10.111358, 10.046270, 19.986916, 19.982077
-        ])
-
-        # Multivariate Hawkes parameters
+        # Calibrated multivariate Hawkes parameters.
         self.multivariate_adjacency = np.array([
         [0.428726,0.040907,0.000000,0.017025,0.000000,0.000000],
         [0.057898,0.493649,0.000000,0.013028,0.000000,0.000000],
@@ -582,43 +562,21 @@ class Simulate:
         self._event_detail = None
         self._mo_fill_log = []
 
-        # --- Unified intensity parameters (stacked 3D arrays for Numba) ---
+        # --- Intensity parameters (stacked 3D arrays for Numba) ---
         d = len(self.labels)
-        if self.arrival_mode == "poisson":
-            rates = [self.poisson_rates[l] for l in self.labels]
-            self._baseline = np.array(rates)
-            self._n_kernels = 1
-            self._adjacency_list = [np.zeros((d, d))]
-            self._decays_list = [np.ones((d, d))]
+        self._baseline = self.multivariate_baseline.copy()
+        self._n_kernels = 1
+        self._adjacency_list = [self.multivariate_adjacency.copy()]
+        self._decays_list = [self.multivariate_decays.copy()]
 
-        elif self.arrival_mode == "hawkes_univariate":
-            self._baseline = self.univariate_baseline.copy()
-            self._n_kernels = 1
-            self._adjacency_list = [self.univariate_adjacency.copy()]
-            self._decays_list = [self.univariate_decays.copy()]
-
-        elif self.arrival_mode == "hawkes_multivariate":
-            self._baseline = self.multivariate_baseline.copy()
-            self._n_kernels = 1
-            self._adjacency_list = [self.multivariate_adjacency.copy()]
-            self._decays_list = [self.multivariate_decays.copy()]
-        else:
-            raise ValueError(f"Unknown arrival_mode: {self.arrival_mode}")
-
-        # Symmetric MO self-excitation tuning (single-kernel multivariate only).
+        # Symmetric MO self-excitation tuning.
         # Default 1.0 leaves calibrated matrices unchanged.
         if self.mo_self_scale != 1.0:
-            if self.arrival_mode == "hawkes_multivariate":
-                mo_bid = self.labels.index("MO_bid")
-                mo_ask = self.labels.index("MO_ask")
-                adj = self._adjacency_list[0]
-                s = self.mo_self_scale
-                adj[mo_bid, mo_bid] *= s
-                adj[mo_ask, mo_ask] *= s
-            else:
-                raise ValueError(
-                    "mo_self_scale applies only to hawkes_multivariate"
-                )
+            mo_bid = self.labels.index("MO_bid")
+            mo_ask = self.labels.index("MO_ask")
+            adj = self._adjacency_list[0]
+            adj[mo_bid, mo_bid] *= self.mo_self_scale
+            adj[mo_ask, mo_ask] *= self.mo_self_scale
 
         # --- Optional directional drift on the buy market-order baseline ---
         # MO_bid (idx 0) is the buy-trade arrival that walks the ask up, so
@@ -1615,22 +1573,22 @@ class Simulate:
         return max(1, depth)
 
     def order_regime(self, spread, resil_mult=1.0):
-        p_best = self.lo_p_best
+        p_best = self.pi_best
         if spread < 2:
             p_inside = 0.0  # no interior tick exists at a 1-tick spread
         else:
-            if spread <= self.lo_inside_break:
-                raw = spread * self.lo_inside_c1 + self.lo_inside_c0
+            if spread <= self.pi_in_break:
+                raw = spread * self.pi_in_c1 + self.pi_in_c0
             else:
-                raw = spread * self.lo_inside_c1_hi + self.lo_inside_c0_hi
-            p_inside = self.lo_inside_spread_scale * min(0.5, max(0.0, raw))
+                raw = spread * self.pi_in_c1_hi + self.pi_in_c0_hi
+            p_inside = self.rho_in * min(0.5, max(0.0, raw))
 
         if resil_mult != 1.0:
             p_best *= resil_mult
             p_inside *= resil_mult
             tot = p_best + p_inside
-            if tot > self.resil_pmax:
-                shrink = self.resil_pmax / tot
+            if tot > self.pi_max:
+                shrink = self.pi_max / tot
                 p_best *= shrink
                 p_inside *= shrink
 
@@ -1647,7 +1605,7 @@ class Simulate:
         """Placement-aggressiveness multiplier ``1 + tanh(z)`` for the
         resiliency (stimulated-refill) and trend-chasing placement biases.
 
-        ``z = resil_kappa * x - resil_phi * sgn * trend`` where ``x`` is the
+        ``z = resil_kappa * x - resil_varphi * sgn * trend`` where ``x`` is the
         side-signed band-pass displacement ``mid - 2*EMA_tau + EMA_2tau``
         (responds fully to a sudden move, decays over ~1.4*tau, identically
         zero along a steady trend) and ``trend = EMA_tau - EMA_flow`` (zero
@@ -1666,21 +1624,21 @@ class Simulate:
         if self.resil_kappa != 0.0:
             dev = (bb + ba) * 0.5 - 2.0 * self._resil_ema + self._resil_ema2
             x = side_sign * dev
-            if x > self.resil_xcap:
-                x = self.resil_xcap
-            elif x < -self.resil_xcap:
-                x = -self.resil_xcap
+            if x > self.x_cap:
+                x = self.x_cap
+            elif x < -self.x_cap:
+                x = -self.x_cap
             z += self.resil_kappa * x
-        if self.resil_phi != 0.0:
+        if self.resil_varphi != 0.0:
             trend = self._resil_ema - self._resil_ema_flow
             # trend > 0 (rising): boost bid-side aggression, suppress ask
             trend_signal = -side_sign * trend
             y = trend_signal
-            if y > self.resil_xcap:
-                y = self.resil_xcap
-            elif y < -self.resil_xcap:
-                y = -self.resil_xcap
-            z += self.resil_phi * y
+            if y > self.x_cap:
+                y = self.x_cap
+            elif y < -self.x_cap:
+                y = -self.x_cap
+            z += self.resil_varphi * y
         if z == 0.0:
             return 1.0
         # Rate-preserving form: the two sides get (1 + tanh z) and
@@ -2308,7 +2266,7 @@ class Simulate:
         self._resil_ema2 = None
         self._resil_ema_flow = None
         self._resil_t = 0.0
-        _resil_on = (self.resil_kappa != 0.0) or (self.resil_phi != 0.0)
+        _resil_on = (self.resil_kappa != 0.0) or (self.resil_varphi != 0.0)
 
         if not self.lightweight:
             self._mo_buf.clear()
@@ -2362,13 +2320,13 @@ class Simulate:
                     if dtr > 0.0:
                         self._resil_ema = mid_pre_ticks + (
                             (self._resil_ema - mid_pre_ticks)
-                            * exp(-dtr / self.resil_tau_s))
+                            * exp(-dtr / self.resil_tau))
                         self._resil_ema2 = mid_pre_ticks + (
                             (self._resil_ema2 - mid_pre_ticks)
-                            * exp(-dtr / (2.0 * self.resil_tau_s)))
+                            * exp(-dtr / (2.0 * self.resil_tau)))
                         self._resil_ema_flow = mid_pre_ticks + (
                             (self._resil_ema_flow - mid_pre_ticks)
-                            * exp(-dtr / self.resil_flow_tau_s))
+                            * exp(-dtr / self.resil_tau_f))
                 self._resil_t = t
 
             if self.recording_mode == 'full':
@@ -2474,10 +2432,3 @@ class Simulate:
             np.asarray(self._mid_v, dtype=np.float64),
         )
 
-
-# ---------------------------------------------------------------------------
-# Backwards-compatible alias. The Numba engine used to live in a separate
-# ``simulate_fast.py`` as ``SimulateFast``; it is now the one and only engine.
-# Existing imports (``from .simulate import SimulateFast``) keep working.
-# ---------------------------------------------------------------------------
-SimulateFast = Simulate

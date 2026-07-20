@@ -1,4 +1,4 @@
-"""Online supervised ("RL") learning of the fill-probability NN.
+"""Online supervised adaptation of the fill-probability NN.
 
 The fill network only *predicts* fill probability; the HJB still does the
 quoting.  The loop is iterative/fitted supervised learning with a replay
@@ -13,10 +13,12 @@ buffer:
     rounds.
 3.  Save a fresh, drop-in checkpoint; the next round of workers loads it.
 
-Plotting predicted-vs-realized between rounds shows the calibration converge.
+Plotting predicted-vs-realized between rounds shows whether calibration
+improves. There is no reward or policy-gradient objective in this module.
 
-CPU-only: the network is tiny and ``torch.set_num_threads(1)`` is set per
-worker; no CUDA is required.
+CPU-only: inference workers remain single-threaded to prevent Joblib
+oversubscription. The parent-process trainer may use multiple Torch threads;
+no CUDA is required.
 
 This module is fully additive and reload-safe: it does not change any existing
 quoting behaviour (the feature logging in :class:`CadenceNNErgodicMM` is gated
@@ -25,6 +27,7 @@ on ``feature_log is not None`` and stays off for normal runs).
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -63,6 +66,7 @@ class RLFillMM(CadenceNNErgodicMM):
                  rl_use_realized: bool = False,
                  rl_t0: Optional[float] = None, rl_span: Optional[float] = None,
                  rl_queue_transform: Optional[str] = None,
+                 rl_queue_ahead_mode: str = "exact_fifo",
                  **kwargs):
         super().__init__(*args, **kwargs)
         self._rl_feat_mean = rl_feat_mean
@@ -72,6 +76,7 @@ class RLFillMM(CadenceNNErgodicMM):
         self._rl_t0 = rl_t0
         self._rl_span = rl_span
         self._rl_queue_transform = rl_queue_transform
+        self._rl_queue_ahead_mode = str(rl_queue_ahead_mode)
         # Enable per-window feature logging in the base class.
         self.feature_log = []
 
@@ -84,6 +89,7 @@ class RLFillMM(CadenceNNErgodicMM):
             agent=self, use_realized=self._rl_use_realized,
             t0=self._rl_t0, span=self._rl_span,
             queue_transform=self._rl_queue_transform,
+            queue_ahead_mode=self._rl_queue_ahead_mode,
         )[0]
         X_a = assemble_fill_X(
             2, self._rl_feat_mean, self._rl_feat_std, self._rl_n_feat,
@@ -91,6 +97,7 @@ class RLFillMM(CadenceNNErgodicMM):
             agent=self, use_realized=self._rl_use_realized,
             t0=self._rl_t0, span=self._rl_span,
             queue_transform=self._rl_queue_transform,
+            queue_ahead_mode=self._rl_queue_ahead_mode,
         )[0]
         return X_b, X_a
 
@@ -111,7 +118,6 @@ def run_fill_rl_sim(
     tol: float,
     T: int,
     max_delta: float = 2.0,
-    arrival_mode: str = "hawkes_multivariate",
     drift_eps: float = 0.0,
     requote_cadence: float = 1.0,
     base_seed: int = 12345,
@@ -119,22 +125,25 @@ def run_fill_rl_sim(
     vol_feature_mode: str = "auto",
     agents_affect_kernels: bool = False,
     agents_affect_mo_sizing: bool = False,
-    lo_inside_spread_scale: float = 0.0,
+    rho_in: float = 0.0,
     solver_engine: str = "scan",
+    candidate_grid: str = "legal",
+    queue_ahead_mode: str = "exact_fifo",
     resil_kappa: float = 0.0,
-    resil_tau_s: float = 10.0,
-    resil_phi: float = 0.0,
-    resil_flow_tau_s: float = 40.0,
+    resil_tau: float = 10.0,
+    resil_varphi: float = 0.0,
+    resil_tau_f: float = 40.0,
     verbose: bool = False,
 ) -> Dict[str, Any]:
-    """Run one single-agent ``SimulateFast`` and collect fill training tuples.
+    """Run one single-agent ``Simulate`` and collect fill training tuples.
 
     The lone agent quotes via the HJB using the fill network at ``ckpt_path``
     and logs, per 1s window and side, the normalised NN input row, the realized
     fill in ``{0, 1}`` and the predicted ``h``.  Returns compact numpy arrays
     (small IPC) so the parent can train on them:
 
-    ``{"run_id", "seed", "t_end", "X" (N, in_dim), "y" (N,), "pred" (N,)}``.
+    ``{"run_id", "seed", "t_end", "realized_pnl", "X" (N, in_dim),
+    "y" (N,), "pred" (N,)}``.
 
     The environment matches the competition runs (single agent, agents do not
     excite the Hawkes kernels, no in-spread background LOs) so the learned net
@@ -145,7 +154,7 @@ def run_fill_rl_sim(
 
     seed = init_worker_seed(base_seed, run_id)
 
-    from .simulate import SimulateFast
+    from .simulate import Simulate
 
     bundle = _load_nn_bundle(ckpt_path)
     extractor = SimFeatureExtractor(DEFAULT_N_QUEUE_LEVELS)
@@ -155,13 +164,16 @@ def run_fill_rl_sim(
     holder: list = [None]
     h_bid = make_sim_nn_h_fn(
         1, bundle, holder, day_t0_s=0.0, day_span_s=day_span_s,
-        vol_feature_mode=vol_feature_mode)
+        vol_feature_mode=vol_feature_mode,
+        queue_ahead_mode=queue_ahead_mode)
     h_ask = make_sim_nn_h_fn(
         2, bundle, holder, day_t0_s=0.0, day_span_s=day_span_s,
-        vol_feature_mode=vol_feature_mode)
+        vol_feature_mode=vol_feature_mode,
+        queue_ahead_mode=queue_ahead_mode)
     agent = RLFillMM(
         **erg_params, gamma=gamma, size=size, verbose=False,
         solver_tick=solver_tick, solver_engine=solver_engine,
+        candidate_grid=candidate_grid,
         h_b=h_bid, h_a=h_ask,
         poisson_tau=poisson_tau, delta_lo=delta_lo, max_delta=max_delta,
         max_iter=max_iter, tol=tol, state_extractor=extractor,
@@ -169,7 +181,8 @@ def run_fill_rl_sim(
         rl_feat_mean=bundle["feat_mean"], rl_feat_std=bundle["feat_std"],
         rl_n_feat=bundle["n_feat"], rl_use_realized=use_realized,
         rl_t0=0.0, rl_span=day_span_s,
-        rl_queue_transform=bundle.get("queue_transform", None))
+        rl_queue_transform=bundle.get("queue_transform", None),
+        rl_queue_ahead_mode=queue_ahead_mode)
     holder[0] = agent
 
     _devnull = open(os.devnull, "w", encoding="utf-8", errors="replace")
@@ -177,15 +190,14 @@ def run_fill_rl_sim(
     if not verbose:
         sys.stdout = _devnull
     try:
-        sim = SimulateFast(
-            arrival_mode=arrival_mode, T=int(T),
-            lightweight=True, agents_when_lightweight=True,
+        sim = Simulate(
+            T=int(T), lightweight=True, agents_when_lightweight=True,
             agents=[agent], shuffle_agents=False, drift_eps=drift_eps,
             agents_affect_kernels=agents_affect_kernels,
             agents_affect_mo_sizing=agents_affect_mo_sizing,
-            lo_inside_spread_scale=lo_inside_spread_scale,
-            resil_kappa=resil_kappa, resil_tau_s=resil_tau_s,
-            resil_phi=resil_phi, resil_flow_tau_s=resil_flow_tau_s,
+            rho_in=rho_in,
+            resil_kappa=resil_kappa, resil_tau=resil_tau,
+            resil_varphi=resil_varphi, resil_tau_f=resil_tau_f,
             tick_size=tick_size)
         sim.load_real_orderbook_snapshot(**snapshot_kwargs)
         sim.run()
@@ -207,8 +219,14 @@ def run_fill_rl_sim(
         y = np.empty((0,), dtype=np.float32)
         pred = np.empty((0,), dtype=np.float32)
 
+    realized_pnl = (
+        float(agent.state_log[-1][4])
+        if agent.state_log
+        else float(agent.cash)
+    )
     return {
         "run_id": int(run_id), "seed": int(seed), "t_end": t_end,
+        "realized_pnl": realized_pnl,
         "X": X, "y": y, "pred": pred, "n_windows": int(X.shape[0]),
     }
 
@@ -230,7 +248,6 @@ def run_fill_rl_multi_sim(
     tol: float,
     T: int,
     max_delta: float = 2.0,
-    arrival_mode: str = "hawkes_multivariate",
     drift_eps: float = 0.0,
     requote_cadence: float = 1.0,
     base_seed: int = 12345,
@@ -238,15 +255,17 @@ def run_fill_rl_multi_sim(
     vol_feature_mode: str = "auto",
     agents_affect_kernels: bool = False,
     agents_affect_mo_sizing: bool = False,
-    lo_inside_spread_scale: float = 0.0,
+    rho_in: float = 0.0,
     solver_engine: str = "scan",
+    candidate_grid: str = "legal",
+    queue_ahead_mode: str = "exact_fifo",
     resil_kappa: float = 0.0,
-    resil_tau_s: float = 10.0,
-    resil_phi: float = 0.0,
-    resil_flow_tau_s: float = 40.0,
+    resil_tau: float = 10.0,
+    resil_varphi: float = 0.0,
+    resil_tau_f: float = 40.0,
     verbose: bool = False,
 ) -> Dict[str, Any]:
-    """Run one ``n_agents``-agent ``SimulateFast`` and collect fill training
+    """Run one ``n_agents``-agent ``Simulate`` and collect fill training
     tuples from **all** agents (pooled).
 
     Identical to :func:`run_fill_rl_sim` except ``n_agents`` RLFillMM agents
@@ -259,7 +278,7 @@ def run_fill_rl_multi_sim(
 
     seed = init_worker_seed(base_seed, run_id)
 
-    from .simulate import SimulateFast
+    from .simulate import Simulate
 
     bundle = _load_nn_bundle(ckpt_path)
     extractor = SimFeatureExtractor(DEFAULT_N_QUEUE_LEVELS)
@@ -271,13 +290,16 @@ def run_fill_rl_multi_sim(
         holder: list = [None]
         h_bid = make_sim_nn_h_fn(
             1, bundle, holder, day_t0_s=0.0, day_span_s=day_span_s,
-            vol_feature_mode=vol_feature_mode)
+            vol_feature_mode=vol_feature_mode,
+            queue_ahead_mode=queue_ahead_mode)
         h_ask = make_sim_nn_h_fn(
             2, bundle, holder, day_t0_s=0.0, day_span_s=day_span_s,
-            vol_feature_mode=vol_feature_mode)
+            vol_feature_mode=vol_feature_mode,
+            queue_ahead_mode=queue_ahead_mode)
         agent = RLFillMM(
             **erg_params, gamma=gamma, size=size, verbose=False,
             solver_tick=solver_tick, solver_engine=solver_engine,
+            candidate_grid=candidate_grid,
             h_b=h_bid, h_a=h_ask,
             poisson_tau=poisson_tau, delta_lo=delta_lo, max_delta=max_delta,
             max_iter=max_iter, tol=tol, state_extractor=extractor,
@@ -286,7 +308,8 @@ def run_fill_rl_multi_sim(
             rl_feat_mean=bundle["feat_mean"], rl_feat_std=bundle["feat_std"],
             rl_n_feat=bundle["n_feat"], rl_use_realized=use_realized,
             rl_t0=0.0, rl_span=day_span_s,
-            rl_queue_transform=bundle.get("queue_transform", None))
+            rl_queue_transform=bundle.get("queue_transform", None),
+            rl_queue_ahead_mode=queue_ahead_mode)
         holder[0] = agent
         agents.append(agent)
 
@@ -295,15 +318,14 @@ def run_fill_rl_multi_sim(
     if not verbose:
         sys.stdout = _devnull
     try:
-        sim = SimulateFast(
-            arrival_mode=arrival_mode, T=int(T),
-            lightweight=True, agents_when_lightweight=True,
+        sim = Simulate(
+            T=int(T), lightweight=True, agents_when_lightweight=True,
             agents=agents, shuffle_agents=True, drift_eps=drift_eps,
             agents_affect_kernels=agents_affect_kernels,
             agents_affect_mo_sizing=agents_affect_mo_sizing,
-            lo_inside_spread_scale=lo_inside_spread_scale,
-            resil_kappa=resil_kappa, resil_tau_s=resil_tau_s,
-            resil_phi=resil_phi, resil_flow_tau_s=resil_flow_tau_s,
+            rho_in=rho_in,
+            resil_kappa=resil_kappa, resil_tau=resil_tau,
+            resil_varphi=resil_varphi, resil_tau_f=resil_tau_f,
             tick_size=tick_size)
         sim.load_real_orderbook_snapshot(**snapshot_kwargs)
         sim.run()
@@ -353,6 +375,7 @@ def update_fill_nn(
     weight_decay: float = 0.0,
     seed: int = 0,
     verbose: bool = True,
+    training_num_threads: int = 1,
 ) -> Dict[str, Any]:
     """Warm-start the fill net from ``ckpt_path`` and fit ``X -> y`` (BCE).
 
@@ -361,69 +384,92 @@ def update_fill_nn(
     checkpoint at ``out_path`` (all metadata copied, only ``state_dict``
     replaced) usable directly as a ``ckpt_path`` for the sim workers.
 
-    Returns ``{"out_path", "n", "loss_first", "loss_last"}``.
+    ``training_num_threads`` applies only to this parent-process update. Live
+    simulation workers continue to use one Torch thread each.
+
+    Returns training losses, elapsed time, and the effective thread count.
     """
     import torch
     import torch.nn as nn
 
     if X.shape[0] == 0:
         raise ValueError("update_fill_nn received no training rows.")
+    if int(training_num_threads) < 1:
+        raise ValueError("training_num_threads must be at least one.")
 
     torch.manual_seed(int(seed))
 
     # Reuse the exact inference architecture (eval mode); switch to train.
     bundle = _load_nn_bundle(ckpt_path)
-    model = bundle["model"]
-    model.train()
+    previous_num_threads = torch.get_num_threads()
+    training_started_at = time.perf_counter()
+    try:
+        torch.set_num_threads(int(training_num_threads))
+        effective_num_threads = torch.get_num_threads()
+        model = bundle["model"]
+        model.train()
 
-    Xt = torch.from_numpy(np.ascontiguousarray(X, dtype=np.float32))
-    yt = torch.from_numpy(np.ascontiguousarray(y, dtype=np.float32))
-    n = Xt.shape[0]
+        Xt = torch.from_numpy(np.ascontiguousarray(X, dtype=np.float32))
+        yt = torch.from_numpy(np.ascontiguousarray(y, dtype=np.float32))
+        n = Xt.shape[0]
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr,
-                                  weight_decay=weight_decay)
-    criterion = nn.BCEWithLogitsLoss()
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+        criterion = nn.BCEWithLogitsLoss()
 
-    rng = np.random.default_rng(int(seed))
-    loss_first = None
-    loss_last = None
-    for ep in range(int(epochs)):
-        perm = rng.permutation(n)
-        ep_loss = 0.0
-        ep_count = 0
-        for start in range(0, n, int(batch_size)):
-            idx = perm[start:start + int(batch_size)]
-            xb = Xt[idx]
-            yb = yt[idx]
-            optimizer.zero_grad()
-            logits = model(xb)
-            loss = criterion(logits, yb)
-            loss.backward()
-            optimizer.step()
-            bs = xb.shape[0]
-            ep_loss += float(loss.item()) * bs
-            ep_count += bs
-        ep_loss /= max(1, ep_count)
-        if loss_first is None:
-            loss_first = ep_loss
-        loss_last = ep_loss
-        if verbose:
-            print(f"    [update] epoch {ep + 1}/{epochs}  BCE={ep_loss:.5f}",
-                  flush=True)
+        rng = np.random.default_rng(int(seed))
+        loss_first = None
+        loss_last = None
+        for ep in range(int(epochs)):
+            perm = rng.permutation(n)
+            ep_loss = 0.0
+            ep_count = 0
+            for start in range(0, n, int(batch_size)):
+                idx = perm[start:start + int(batch_size)]
+                xb = Xt[idx]
+                yb = yt[idx]
+                optimizer.zero_grad()
+                logits = model(xb)
+                loss = criterion(logits, yb)
+                loss.backward()
+                optimizer.step()
+                bs = xb.shape[0]
+                ep_loss += float(loss.item()) * bs
+                ep_count += bs
+            ep_loss /= max(1, ep_count)
+            if loss_first is None:
+                loss_first = ep_loss
+            loss_last = ep_loss
+            if verbose:
+                print(
+                    f"    [update] epoch {ep + 1}/{epochs}  BCE={ep_loss:.5f}",
+                    flush=True,
+                )
 
-    model.eval()
+        model.eval()
 
-    # Save a drop-in checkpoint: copy all metadata, replace only the weights.
-    raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    raw["state_dict"] = {k: v.detach().cpu().clone()
-                         for k, v in model.state_dict().items()}
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save(raw, out_path)
+        # Save a drop-in checkpoint with updated weights and unchanged metadata.
+        raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        raw["state_dict"] = {
+            key: value.detach().cpu().clone()
+            for key, value in model.state_dict().items()
+        }
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        torch.save(raw, out_path)
+        training_seconds = time.perf_counter() - training_started_at
+    finally:
+        torch.set_num_threads(previous_num_threads)
 
     return {
-        "out_path": str(out_path), "n": int(n),
+        "out_path": str(out_path),
+        "n": int(n),
         "loss_first": float(loss_first),
         "loss_last": float(loss_last),
+        "training_seconds": float(training_seconds),
+        "training_num_threads": int(effective_num_threads),
     }
 
 
