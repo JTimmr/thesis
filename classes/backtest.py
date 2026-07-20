@@ -360,8 +360,7 @@ class MMBacktester:
         hawkes
             Online Hawkes intensity filter to attach to the replay
             simulator.  ``True`` (default) installs the KGHM **single-kernel**
-            multivariate calibration shared with
-            ``Simulate(arrival_mode='hawkes_multivariate')``.
+            multivariate calibration shared with ``Simulate``.
             Pass a :class:`HawkesFilter` instance to use its parameters
             as a template (a fresh clone is built per window), a
             zero-arg callable for full control, or ``False`` / ``None``

@@ -1,54 +1,20 @@
 """Public API for domain logic."""
 
-from .analyse import AnalyseMarket
-from .backtest import MMBacktester, SweepResult
-from .calibrate import (
-    HawkesCalibration,
-    get_average_seasonality_shape,
-    plot_all_seasonality_patterns,
-)
 from . import helpers
 from .extract import (
     extract_events_for_day,
     infer_trade_side,
     list_day_keys_hdf,
+    load_extraction_stats,
     load_orders_day,
     load_trades_day,
     run_full_extraction,
     summarize_side_stats,
 )
-from .hawkes_filter import (
-    DEFAULT_LABELS as HAWKES_LABELS,
-    HawkesFilter,
-    classify_event as classify_hawkes_event,
-    classify_mo as classify_hawkes_mo,
-)
-from .market_maker import (
-    ErgodicMM,
-    NumericalErgodicMM,
-)
 from .orderbook import HeapOrderBook
-from .phantom_labels import (
-    PHANTOM_PER_T_FEATURES,
-    PhantomLabelConfig,
-    PhantomLabeller,
-    realized_vol_time_grid,
-    write_day_parquet,
-    write_feature_schema,
-    write_manifest,
-)
-from .simulate import Simulate
-from .mo_sim_calibrate import (
-    DEFAULT_MO_SELF_SCALE,
-    LAYER_A_TOL_TICKS,
-    LAYER_C_TOL_TICKS,
-    calibrate_and_validate_mo_sim,
-    calibrate_mo_impact,
-    mo_cal_tag,
-    run_layer_c_comparison,
-)
-from .simulate import SimulateFast
+from .analyse import AnalyseMarket
 from .helpers import plot_mm_result_compact
+from .simulate import Simulate
 
 load_day_events_from_sqlite = helpers.load_day_events_from_sqlite
 load_events_from_sqlite_bulk = helpers.load_events_from_sqlite_bulk
@@ -60,32 +26,40 @@ project_root = helpers.project_root
 data_dir = helpers.data_dir
 resolve_data_path = helpers.resolve_data_path
 
-__all__ = [
-    "AnalyseMarket",
-    "ErgodicMM",
-    "HAWKES_LABELS",
-    "HawkesCalibration",
-    "HawkesFilter",
-    "HeapOrderBook",
-    "DEFAULT_MO_SELF_SCALE",
-    "LAYER_A_TOL_TICKS",
-    "LAYER_C_TOL_TICKS",
-    "MMBacktester",
-    "NumericalErgodicMM",
-    "PHANTOM_PER_T_FEATURES",
+_phantom_exports = {
     "PhantomLabelConfig",
     "PhantomLabeller",
-    "realized_vol_time_grid",
     "write_day_parquet",
     "write_feature_schema",
     "write_manifest",
-    "Simulate",
-    "SimulateFast",
-    "SweepResult",
-    "calibrate_and_validate_mo_sim",
-    "calibrate_mo_impact",
-    "classify_hawkes_event",
-    "classify_hawkes_mo",
+}
+_calibrate_exports = {
+    "HawkesCalibration",
+    "get_average_seasonality_shape",
+    "plot_all_seasonality_patterns",
+}
+
+
+def __getattr__(name):
+    if name in _phantom_exports:
+        from . import phantom_labels
+
+        value = getattr(phantom_labels, name)
+        globals()[name] = value
+        return value
+    if name in _calibrate_exports:
+        from . import calibrate
+
+        value = getattr(calibrate, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = [
+    "AnalyseMarket",
+    "HawkesCalibration",
+    "HeapOrderBook",
     "compute_end_times",
     "data_dir",
     "estimate_seasonality_profiles",
@@ -94,18 +68,23 @@ __all__ = [
     "helpers",
     "infer_trade_side",
     "list_day_keys",
-    "mo_cal_tag",
     "list_day_keys_from_sqlite",
     "list_day_keys_hdf",
+    "load_extraction_stats",
     "load_day_events_from_sqlite",
     "load_events_from_sqlite_bulk",
     "load_orders_day",
     "load_trades_day",
+    "PhantomLabelConfig",
+    "PhantomLabeller",
     "plot_all_seasonality_patterns",
     "plot_mm_result_compact",
     "resolve_data_path",
     "run_full_extraction",
+    "Simulate",
     "summarize_side_stats",
-    "run_layer_c_comparison",
+    "write_day_parquet",
+    "write_feature_schema",
+    "write_manifest",
     "project_root",
 ]

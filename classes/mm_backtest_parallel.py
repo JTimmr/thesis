@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional, Union
 import numpy as np
 import pandas as pd
 
+from .queue_ahead import queue_ahead_from_live_sim
+
 
 def get_day_span_s(db_path: Union[str, Path], day: str) -> float:
     """Return the replay span for *day* in seconds (same base as ``_replay``)."""
@@ -97,10 +99,9 @@ def single_multivariate_hawkes_factory(
     :class:`~research_core.classes.simulate.Simulate`).
     """
     from .hawkes_filter import HawkesFilter
-    from .simulate import SimulateFast
+    from .simulate import Simulate
 
-    sim = SimulateFast(
-        "hawkes_multivariate",
+    sim = Simulate(
         T=1,
         tick_size=tick_size,
         mo_self_scale=float(mo_self_scale),
@@ -213,6 +214,8 @@ def _load_nn_bundle(ckpt_path: str) -> Dict[str, Any]:
     import torch
     import torch.nn as nn
 
+    torch.set_num_threads(1)
+
     class _FillProbMLP(nn.Module):
         def __init__(self, in_dim: int, hidden: list, dropout: float = 0.0):
             super().__init__()
@@ -267,6 +270,8 @@ def assemble_fill_X(
     t0: Optional[float] = None,
     span: Optional[float] = None,
     queue_transform: Optional[str] = None,
+    queue_ahead_override=None,
+    queue_ahead_mode: str = "exact_fifo",
 ):
     """Assemble the normalised NN input matrix ``X`` for one quote side.
 
@@ -282,7 +287,16 @@ def assemble_fill_X(
     training mean is used.  Used by both the inference closure in
     :func:`_make_nn_h_fn` and the online RL feature logger so the logged
     training rows are byte-identical to what the model saw at quote time.
+    ``queue_ahead_mode`` is either ``"exact_fifo"`` (retained live-order
+    priority) or ``"cumulative_depth"`` (the placement-time feature used by
+    phantom-label training). ``queue_ahead_override`` supplies counterfactual
+    queue positions directly for the coordinated benchmark.
     """
+    if queue_ahead_mode not in ("exact_fifo", "cumulative_depth"):
+        raise ValueError(
+            "queue_ahead_mode must be 'exact_fifo' or 'cumulative_depth', "
+            f"got {queue_ahead_mode!r}"
+        )
     delta = np.atleast_1d(np.asarray(delta, dtype=np.float64))
     n = delta.shape[0]
     side_enc = float(side_int - 1)
@@ -326,28 +340,48 @@ def assemble_fill_X(
     z_norm = (z_raw - feat_mean[:n_feat]) / feat_std[:n_feat]
     d_norm = (delta.astype(np.float32) - feat_mean[n_feat]) / feat_std[n_feat]
 
-    if bs is not None and bb is not None and ba is not None:
-        half_spread = (ba - bb) / 2.0
-        if side_int == 1:
-            side_depths = np.nan_to_num(bs.bid_depths[:40], nan=0.0)
-        else:
-            side_depths = np.nan_to_num(bs.ask_depths[:40], nan=0.0)
-        levels = np.floor((delta - half_spread) / tick).astype(int)
-        cum_depth = np.cumsum(side_depths)
-        levels_clamped = np.clip(levels, -1, len(cum_depth) - 1)
-        queue_ahead = np.where(
-            levels_clamped < 0, 0.0,
-            cum_depth[np.clip(levels_clamped, 0, len(cum_depth) - 1)]
-        )
-        qa_val = queue_ahead.astype(np.float32)
-        if queue_transform == "log1p":
-            qa_val = np.log1p(qa_val)
-        q_norm = (qa_val - feat_mean[n_feat + 1]) / feat_std[n_feat + 1]
+    if queue_ahead_override is not None:
+        queue_ahead = np.asarray(queue_ahead_override, dtype=np.float64)
+        if queue_ahead.ndim == 0:
+            queue_ahead = np.full(delta.shape, float(queue_ahead), dtype=np.float64)
+        if queue_ahead.shape != delta.shape:
+            raise ValueError(
+                "queue_ahead_override must be scalar or have the same shape "
+                f"as delta; got {queue_ahead.shape} and {delta.shape}"
+            )
+        queue_ahead = np.where(np.isfinite(queue_ahead), queue_ahead, 0.0)
+        np.maximum(queue_ahead, 0.0, out=queue_ahead)
     else:
-        qa_fallback = np.float32(0.0)
-        if queue_transform == "log1p":
-            qa_fallback = np.log1p(qa_fallback)
-        q_norm = np.full(n, (qa_fallback - feat_mean[n_feat + 1]) / feat_std[n_feat + 1], dtype=np.float32)
+        queue_ahead = None
+        if queue_ahead_mode == "exact_fifo":
+            queue_ahead = queue_ahead_from_live_sim(
+                sim, side_int, delta, agent=agent,
+            )
+        if (
+            queue_ahead is None
+            and bs is not None
+            and bb is not None
+            and ba is not None
+        ):
+            half_spread = (ba - bb) / 2.0
+            if side_int == 1:
+                side_depths = np.nan_to_num(bs.bid_depths[:40], nan=0.0)
+            else:
+                side_depths = np.nan_to_num(bs.ask_depths[:40], nan=0.0)
+            levels = np.floor((delta - half_spread) / tick).astype(int)
+            cum_depth = np.cumsum(side_depths)
+            levels_clamped = np.clip(levels, -1, len(cum_depth) - 1)
+            queue_ahead = np.where(
+                levels_clamped < 0, 0.0,
+                cum_depth[np.clip(levels_clamped, 0, len(cum_depth) - 1)]
+            )
+        elif queue_ahead is None:
+            queue_ahead = np.zeros(n, dtype=np.float64)
+
+    qa_val = queue_ahead.astype(np.float32)
+    if queue_transform == "log1p":
+        qa_val = np.log1p(qa_val)
+    q_norm = (qa_val - feat_mean[n_feat + 1]) / feat_std[n_feat + 1]
 
     z_tiled = np.tile(z_norm, (n, 1))
     d_col = d_norm.reshape(-1, 1)
@@ -365,6 +399,7 @@ def _make_nn_h_fn(
     vol_feature_mode: str = "auto",
     day_t0_s: Optional[float] = None,
     day_span_s: Optional[float] = None,
+    queue_ahead_mode: str = "exact_fifo",
 ):
     """Build a fill-law callback ``h_fn(sim, delta)`` for one quote side.
 
@@ -409,6 +444,7 @@ def _make_nn_h_fn(
             side_int, feat_mean, feat_std, n_feat, sim, delta,
             agent=agent_holder[0], use_realized=use_realized,
             t0=_t0, span=_span, queue_transform=_queue_transform,
+            queue_ahead_mode=queue_ahead_mode,
         )
 
         with torch.no_grad():
@@ -423,7 +459,9 @@ def _make_nn_h_fn(
 def _make_numerical_nn_agent(gamma, bundle, agent_holder, *, erg_params,
                              size, solver_tick, poisson_tau, delta_lo,
                              max_iter, tol, vol_feature_mode="auto",
-                             day_t0_s=None, day_span_s=None, max_delta=2.0):
+                             day_t0_s=None, day_span_s=None, max_delta=2.0,
+                             solver_engine="scan", candidate_grid="legal",
+                             queue_ahead_mode="exact_fifo"):
     """Construct one ``NumericalErgodicMM`` with NN fill-law callbacks."""
     from .market_maker import NumericalErgodicMM
 
@@ -431,15 +469,19 @@ def _make_numerical_nn_agent(gamma, bundle, agent_holder, *, erg_params,
     erg_params = {k: v for k, v in erg_params.items() if k != "vol_mode"}
 
     h_bid = _make_nn_h_fn(1, bundle, agent_holder, vol_feature_mode=vol_feature_mode,
-                          day_t0_s=day_t0_s, day_span_s=day_span_s)
+                          day_t0_s=day_t0_s, day_span_s=day_span_s,
+                          queue_ahead_mode=queue_ahead_mode)
     h_ask = _make_nn_h_fn(2, bundle, agent_holder, vol_feature_mode=vol_feature_mode,
-                          day_t0_s=day_t0_s, day_span_s=day_span_s)
+                          day_t0_s=day_t0_s, day_span_s=day_span_s,
+                          queue_ahead_mode=queue_ahead_mode)
     agent = NumericalErgodicMM(
         **erg_params,
         gamma=gamma,
         size=size,
         verbose=False,
         solver_tick=solver_tick,
+        solver_engine=solver_engine,
+        candidate_grid=candidate_grid,
         h_b=h_bid,
         h_a=h_ask,
         poisson_tau=poisson_tau,
@@ -474,6 +516,9 @@ def run_nn_ergodic_single_day(
     day_span_s: Optional[float] = None,
     hawkes: Union[bool, Any] = True,
     max_delta: float = 2.0,
+    solver_engine: str = "scan",
+    candidate_grid: str = "legal",
+    queue_ahead_mode: str = "exact_fifo",
 ) -> Dict[str, Any]:
     """Run one NumericalErgodicMM backtest day with NN fill law.
 
@@ -502,6 +547,8 @@ def run_nn_ergodic_single_day(
         solver_tick=solver_tick, poisson_tau=poisson_tau, delta_lo=delta_lo,
         max_iter=max_iter, tol=tol, vol_feature_mode=vol_feature_mode,
         day_t0_s=day_t0_s, day_span_s=day_span_s, max_delta=max_delta,
+        solver_engine=solver_engine, candidate_grid=candidate_grid,
+        queue_ahead_mode=queue_ahead_mode,
     )
 
     stats = bt.run_single(day, agent)
@@ -543,6 +590,9 @@ def run_nn_ergodic_day_all_gammas(
     vol_feature_mode: str = "auto",
     hawkes: Union[bool, Any] = True,
     max_delta: float = 5.0,
+    solver_engine: str = "scan",
+    candidate_grid: str = "legal",
+    queue_ahead_mode: str = "exact_fifo",
     replay_start_s: Optional[float] = None,
     max_replay_s: Optional[float] = None,
     segment_label: Optional[str] = None,
@@ -609,6 +659,8 @@ def run_nn_ergodic_day_all_gammas(
             solver_tick=solver_tick, poisson_tau=poisson_tau, delta_lo=delta_lo,
             max_iter=max_iter, tol=tol, vol_feature_mode=vol_feature_mode,
             day_t0_s=day_t0_s, day_span_s=day_span_s, max_delta=max_delta,
+            solver_engine=solver_engine, candidate_grid=candidate_grid,
+            queue_ahead_mode=queue_ahead_mode,
         )
         stats = bt._replay(
             orders_df, mos_df, agent,

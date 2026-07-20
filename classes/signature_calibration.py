@@ -1,7 +1,7 @@
 """Sim-outcome (indirect-inference) calibration helpers for the
 state-dependent limit-order placement mechanism.
 
-The resiliency parameters ``(resil_kappa, resil_phi)`` are *effective*
+The resiliency parameters ``(resil_kappa, resil_varphi)`` are *effective*
 reduced-form parameters: in the simulator the placement tilt is the only
 reversion channel, so it must absorb the aggregate effect of every empirical
 reversion channel (contrarian MO flow, cancellation asymmetry, depth
@@ -63,8 +63,8 @@ def run_signature_sessions(template, kappa, phi, tau_s=4.0, flow_tau_s=40.0, T=1
     """One unseeded sim -> list of per-session dense signature curves.
 
     Deep-copies *template*, sets the resiliency parameters (and any
-    ``base_overrides`` attributes, e.g. ``lo_p_best`` / ``lo_inside_c1`` /
-    ``lo_inside_c0``), runs ``T`` events, splits the run into consecutive
+    ``base_overrides`` attributes, e.g. ``pi_best`` / ``pi_in_c1`` /
+    ``pi_in_c0``), runs ``T`` events, splits the run into consecutive
     7.8 h sessions and returns one C(tau) curve (tau = 1..300 s) per
     session — the exact evidence-notebook methodology.
     """
@@ -75,9 +75,9 @@ def run_signature_sessions(template, kappa, phi, tau_s=4.0, flow_tau_s=40.0, T=1
     sim.verbose = False
     sim.capture_mid = True
     sim.resil_kappa = float(kappa)
-    sim.resil_phi = float(phi)
-    sim.resil_tau_s = float(tau_s)
-    sim.resil_flow_tau_s = float(flow_tau_s)
+    sim.resil_varphi = float(phi)
+    sim.resil_tau = float(tau_s)
+    sim.resil_tau_f = float(flow_tau_s)
     if base_overrides:
         for name, value in base_overrides.items():
             setattr(sim, name, value)

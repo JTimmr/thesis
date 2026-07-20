@@ -88,6 +88,31 @@ def read_worker_stdout(worker_id: int, process, out_q: queue.Queue) -> None:
 
 # --- Coordinator ---
 
+def _remove_temp_files(data_file: Path, db_path: Path) -> None:
+    """Delete the coordinator's scratch files.
+
+    ``db_path`` is a SQLite database opened in WAL mode, so it is accompanied by
+    ``-wal`` and ``-shm`` sidecar files that must be removed alongside it. The
+    owning engine must already be disposed; otherwise Windows keeps the handles
+    open and the files cannot be unlinked.
+    """
+    for path in (
+        data_file,
+        db_path,
+        db_path.with_name(db_path.name + "-wal"),
+        db_path.with_name(db_path.name + "-shm"),
+    ):
+        for attempt in range(5):
+            try:
+                path.unlink(missing_ok=True)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    print(f"Warning: could not remove locked temp file: {path}")
+                    break
+                time.sleep(0.2 * (attempt + 1))
+
+
 def run_parallel_optuna(data_dict: dict, objective_type: str, n_workers: int, n_trials: int, study_name: Optional[str] = None) -> dict:
     """Run an Optuna study across *n_workers* subprocesses.
 
@@ -124,90 +149,98 @@ def run_parallel_optuna(data_dict: dict, objective_type: str, n_workers: int, n_
         url=storage_url,
         engine_kwargs={"connect_args": {"timeout": 120}},
     )
-    study = optuna.create_study(
-        study_name=study_name,
-        storage=storage,
-        direction="maximize",
-        load_if_exists=True,
-    )
-    with storage.engine.connect() as conn:
-        conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
+    try:
+        study = optuna.create_study(
+            study_name=study_name,
+            storage=storage,
+            direction="maximize",
+            load_if_exists=True,
+        )
+        with storage.engine.connect() as conn:
+            conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
 
-    trials_per_worker = int(np.ceil(n_trials / n_workers))
+        trials_per_worker = int(np.ceil(n_trials / n_workers))
 
-    # Spawn workers.
-    processes = []
-    for i in range(n_workers):
-        cmd = [
-            sys.executable, "-m", "research_core.classes.parallelisation",
-            "--mode", "worker",
-            "--objective-type", objective_type,
-            "--data-file", str(data_file),
-            "--study-name", study_name,
-            "--storage-url", storage_url,
-            "--n-trials", str(trials_per_worker),
-            "--worker-id", str(i),
+        # Spawn workers.
+        processes = []
+        for i in range(n_workers):
+            cmd = [
+                sys.executable, "-m", "research_core.classes.parallelisation",
+                "--mode", "worker",
+                "--objective-type", objective_type,
+                "--data-file", str(data_file),
+                "--study-name", study_name,
+                "--storage-url", storage_url,
+                "--n-trials", str(trials_per_worker),
+                "--worker-id", str(i),
+            ]
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+            processes.append((i, proc))
+
+        print(f"Launched {n_workers} workers "
+              f"({trials_per_worker} trials each, {objective_type})")
+
+        # Merge worker stdout without blocking the coordinator loop.
+        out_q: queue.Queue = queue.Queue()
+
+        for wid, proc in processes:
+            t = threading.Thread(
+                target=read_worker_stdout,
+                args=(wid, proc, out_q),
+                daemon=True,
+            )
+            t.start()
+
+        done = 0
+        while done < len(processes):
+            try:
+                wid, line = out_q.get(timeout=1.0)
+                if line is None:
+                    done += 1
+                else:
+                    print(f"[W{wid}] {line}", end="", flush=True)
+            except queue.Empty:
+                pass
+
+        for wid, proc in processes:
+            proc.wait()
+            if proc.returncode != 0:
+                print(f"Worker {wid} exited with code {proc.returncode}")
+
+        # Collect results. Reuse the coordinator's storage object (not the URL
+        # string) so a single engine owns every connection to the database; a
+        # fresh study wrapper still reads all trials the workers committed.
+        study = optuna.load_study(study_name=study_name, storage=storage)
+        completed = [
+            t for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE
         ]
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
-        )
-        processes.append((i, proc))
+        print(f"\nCompleted {len(completed)} / {n_trials} trials")
 
-    print(f"Launched {n_workers} workers "
-          f"({trials_per_worker} trials each, {objective_type})")
+        if not completed:
+            results: Dict = {
+                "best_params": None,
+                "best_value": None,
+                "error": "No trials completed",
+            }
+        else:
+            best = study.best_trial
+            results = {"best_params": best.params, "best_value": best.value}
+            print(f"Best score: {best.value:.6f}")
 
-    # Merge worker stdout without blocking the coordinator loop.
-    out_q: queue.Queue = queue.Queue()
-
-    for wid, proc in processes:
-        t = threading.Thread(
-            target=read_worker_stdout,
-            args=(wid, proc, out_q),
-            daemon=True,
-        )
-        t.start()
-
-    done = 0
-    while done < len(processes):
-        try:
-            wid, line = out_q.get(timeout=1.0)
-            if line is None:
-                done += 1
-            else:
-                print(f"[W{wid}] {line}", end="", flush=True)
-        except queue.Empty:
-            pass
-
-    for wid, proc in processes:
-        proc.wait()
-        if proc.returncode != 0:
-            print(f"Worker {wid} exited with code {proc.returncode}")
-
-    # Collect results.
-    study = optuna.load_study(study_name=study_name, storage=storage_url)
-    completed = [
-        t for t in study.trials
-        if t.state == optuna.trial.TrialState.COMPLETE
-    ]
-    print(f"\nCompleted {len(completed)} / {n_trials} trials")
-
-    if not completed:
-        results: Dict = {
-            "best_params": None,
-            "best_value": None,
-            "error": "No trials completed",
-        }
-    else:
-        best = study.best_trial
-        results = {"best_params": best.params, "best_value": best.value}
-        print(f"Best score: {best.value:.6f}")
-
-    # Cleanup.
-    for p in (data_file, db_path):
-        p.unlink(missing_ok=True)
-
-    return results
+        return results
+    finally:
+        # Close the pooled SQLite connections before deleting the files. While
+        # the engine is open it holds the .db and its WAL sidecars locked on
+        # Windows, so unlink() would raise PermissionError and orphan the temp
+        # study. Disposing first makes removal reliable on every platform, and
+        # running it in `finally` guarantees the scratch files never leak even
+        # if result collection raises.
+        storage.engine.dispose()
+        _remove_temp_files(data_file, db_path)
 
 
 # --- CLI entry point ---
