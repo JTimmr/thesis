@@ -26,6 +26,4 @@ packages = [
     "research_core",
     "research_core.classes",
     "research_core.data",
-    "research_core.scripts",
-    "research_core.validation",
 ]
